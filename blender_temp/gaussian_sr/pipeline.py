@@ -1,0 +1,1569 @@
+import gc
+from collections.abc import Callable, Sequence
+import time
+import warnings
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+from torch import Tensor
+
+from .camera import LearnableCameraBundle, LearnableSharedIntrinsics
+from .density_control import (
+    DensityControlResult,
+    DensityViewCoverage,
+    DensityViewObservation,
+    apply_density_control,
+    should_run_density_control_for_stage,
+)
+from .density_logging import emit_density_event
+from .field import CanonicalGaussianField, ScaleAwareResidualHead
+from .image_utils import charbonnier, estimate_translation_bootstrap, ssim_value, tv_loss_grid
+from .math_utils import default_intrinsics
+from .observation_model import observation_render_size, render_observe_rgb
+from .posefree_config import PoseFreeGaussianConfig, TrainConfig
+from .progress_logging import emit_progress_event
+from .warp_gsplat_contracts import RasterConfig
+from .warp_gsplat_renderer import (
+    PreparedVisibility,
+    render_visibility_meta_warp,
+    render_stats_prepared_warp,
+    render_stats_warp,
+    render_values_warp,
+)
+
+_META_STAT_KEYS = (
+    "meta_gaussian_count",
+    "meta_visible_count",
+    "meta_intersection_count",
+    "meta_tile_count",
+    "meta_tiles_x",
+    "meta_tiles_y",
+    "meta_render_width",
+    "meta_render_height",
+)
+_DENSITY_STAT_KEYS = ("contrib", "transmittance", "hits", "residual", "error_map")
+_TORCH_COMPILE_ENABLED = True
+
+
+def set_torch_compile_enabled(enabled: bool) -> None:
+    global _TORCH_COMPILE_ENABLED
+    _TORCH_COMPILE_ENABLED = bool(enabled)
+
+
+def _make_compile_disabled(callable_obj):
+    compiler = getattr(torch, "compiler", None)
+    disable = getattr(compiler, "disable", None)
+    if callable(disable):
+        try:
+            return disable(callable_obj)
+        except Exception:
+            return callable_obj
+    dynamo = getattr(torch, "_dynamo", None)
+    disable = getattr(dynamo, "disable", None)
+    if callable(disable):
+        try:
+            return disable(callable_obj)
+        except Exception:
+            return callable_obj
+    return callable_obj
+
+
+def _clear_compiled_cuda_state() -> None:
+    if not torch.cuda.is_available():
+        return
+    try:
+        from torch._inductor.cudagraph_trees import reset_cudagraph_trees
+    except Exception:
+        reset_cudagraph_trees = None
+    if callable(reset_cudagraph_trees):
+        try:
+            reset_cudagraph_trees()
+        except Exception:
+            pass
+    gc.collect()
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _make_optional_compiled(callable_obj, name: str):
+    if not _TORCH_COMPILE_ENABLED or not hasattr(torch, "compile"):
+        return callable_obj
+    try:
+        # These compiled regions intentionally graph-break around the Warp entrypoints
+        # wrapped by torch.compiler.disable(). fullgraph=True would raise on those
+        # breaks instead of compiling the surrounding train-step code.
+        compiled_obj = torch.compile(
+            callable_obj,
+            dynamic=None,
+            fullgraph=False,
+            mode="max-autotune-no-cudagraphs",
+        )
+    except Exception:
+        return callable_obj
+
+    state = {"compiled": compiled_obj, "warned": False}
+
+    def wrapped(*args, **kwargs):
+        compiled = state["compiled"]
+        if compiled is None:
+            return callable_obj(*args, **kwargs)
+        try:
+            return compiled(*args, **kwargs)
+        except Exception as exc:
+            if isinstance(exc, torch.OutOfMemoryError):
+                _clear_compiled_cuda_state()
+            if not state["warned"]:
+                warnings.warn(
+                    f"torch.compile fallback for {name}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                state["warned"] = True
+            state["compiled"] = None
+            return callable_obj(*args, **kwargs)
+
+    return wrapped
+
+
+class PoseFreeGaussianSR(nn.Module):
+    def __init__(
+        self,
+        image_shape: Sequence[int],
+        intrinsics_init: Tensor,
+        num_views: int,
+        config: PoseFreeGaussianConfig | None = None,
+        anchor_rgb: Tensor | None = None,
+        init_shifts_px: Tensor | None = None,
+    ):
+        super().__init__()
+        self.config = config or PoseFreeGaussianConfig()
+
+        if len(image_shape) != 4:
+            raise ValueError("image_shape must be [V, 3, H, W]")
+        _, c, h, w = image_shape
+        if c != 3:
+            raise ValueError("Only RGB images are supported in this reference implementation.")
+        if anchor_rgb is None:
+            raise ValueError("anchor_rgb is required for field initialization")
+
+        self.train_height = int(h)
+        self.train_width = int(w)
+        self.num_views = int(num_views)
+
+        self.intrinsics = LearnableSharedIntrinsics(
+            initial=intrinsics_init,
+            learn_intrinsics=self.config.camera.learn_intrinsics,
+        )
+        self.field_model = CanonicalGaussianField(
+            anchor_rgb, intrinsics_init, self.config.field, self.config.appearance
+        )
+        self.camera_model = LearnableCameraBundle(
+            num_views=num_views,
+            fx=float(intrinsics_init[0].item()),
+            fy=float(intrinsics_init[1].item()),
+            init_shifts_px=init_shifts_px,
+            device=anchor_rgb.device,
+            dtype=anchor_rgb.dtype,
+        )
+        self.residual_head = (
+            ScaleAwareResidualHead(
+                feature_dim=self.config.field.feature_dim,
+                hidden_dim=self.config.field.residual_hidden_dim,
+                residual_scale=self.config.field.residual_scale,
+            )
+            if self.config.field.use_residual_head
+            else None
+        )
+        self._prepare_render_payload = self._prepare_render_payload_eager
+        self._residual_head_forward = self.residual_head if self.residual_head is not None else None
+        self._postprocess_rgb = self._postprocess_rgb_eager
+        self._observe_and_photometric_loss = self._observe_and_photometric_loss_eager
+        self._regularization_impl = self._regularization
+        self._render_values_with_meta = _make_compile_disabled(self._render_values_with_meta_eager)
+        self._render_density_stats = _make_compile_disabled(self._render_density_stats_eager)
+        self._training_view_forward = _make_optional_compiled(
+            self._training_view_forward_eager,
+            "training_view_forward",
+        )
+        self._training_view_forward_density = _make_optional_compiled(
+            self._training_view_forward_density_eager,
+            "training_view_forward_density",
+        )
+        self._train_step_all_views = _make_optional_compiled(
+            self._train_step_all_views_eager,
+            "train_step_all_views",
+        )
+        self._train_step_all_views_density = _make_optional_compiled(
+            self._train_step_all_views_density_eager,
+            "train_step_all_views_density",
+        )
+
+    @classmethod
+    def from_images(
+        cls,
+        images: Tensor,
+        intrinsics: Tensor | None = None,
+        config: PoseFreeGaussianConfig | None = None,
+    ) -> "PoseFreeGaussianSR":
+        if images.dim() != 4 or images.shape[1] != 3:
+            raise ValueError("images must have shape [V, 3, H, W]")
+        config = config or PoseFreeGaussianConfig()
+        device = images.device
+        dtype = images.dtype
+        _, _, h, w = images.shape
+
+        if intrinsics is None:
+            intrinsics_init = default_intrinsics(h, w, device, dtype, config.camera)
+        else:
+            intrinsics_init = intrinsics.to(device=device, dtype=dtype)
+
+        shifts = estimate_translation_bootstrap(images) if config.train.use_phasecorr_init else None
+
+        return cls(
+            image_shape=tuple(images.shape),
+            intrinsics_init=intrinsics_init,
+            num_views=images.shape[0],
+            config=config,
+            anchor_rgb=images[0],
+            init_shifts_px=shifts,
+        )
+
+    def _make_optimizer(self, train_cfg: TrainConfig) -> torch.optim.Optimizer:
+        params: list[dict[str, object]] = [
+            {"params": list(self.field_model.parameters_for_optimizer()), "lr": train_cfg.lr_field},
+            {"params": list(self.camera_model.parameters()), "lr": train_cfg.lr_camera},
+        ]
+        if self.residual_head is not None:
+            params.append({"params": list(self.residual_head.parameters()), "lr": train_cfg.lr_residual})
+        return torch.optim.Adam(params)
+
+    def _scale_intrinsics(self, out_h: int, out_w: int) -> Tensor:
+        scale_x = out_w / self.train_width
+        scale_y = out_h / self.train_height
+        return self.intrinsics.get(scale_x=scale_x, scale_y=scale_y)
+
+    def _renderer_config(self) -> RasterConfig:
+        render_cfg = self.config.render
+        return RasterConfig(
+            tile_size=render_cfg.tile_size,
+            near_plane=render_cfg.near,
+            far_plane=render_cfg.far,
+            eps2d=render_cfg.eps2d,
+            radius_clip=render_cfg.radius_clip_px,
+            max_sort_buffer_bytes=render_cfg.max_sort_buffer_bytes,
+            rasterize_mode="antialiased" if render_cfg.antialiased_opacity else "classic",
+            alpha_min=render_cfg.alpha_threshold,
+            transmittance_eps=render_cfg.transmittance_threshold,
+            background_rgb=render_cfg.bg_color,
+        )
+
+    def _viewmat_from_pose(self, R_cw: Tensor, t_cw: Tensor) -> Tensor:
+        viewmat = torch.eye(4, device=R_cw.device, dtype=R_cw.dtype)
+        viewmat[:3, :3] = R_cw
+        viewmat[:3, 3] = t_cw
+        return viewmat
+
+    def _K_from_intrinsics(self, intrinsics: Tensor) -> Tensor:
+        fx, fy, cx, cy = intrinsics.unbind(dim=0)
+        K = torch.eye(3, device=intrinsics.device, dtype=intrinsics.dtype)
+        K[0, 0] = fx
+        K[1, 1] = fy
+        K[0, 2] = cx
+        K[1, 2] = cy
+        return K
+
+    def _packed_values(self, rgb: Tensor, latent: Tensor) -> Tensor:
+        alpha_one = torch.ones(rgb.shape[0], 1, device=rgb.device, dtype=rgb.dtype)
+        return torch.cat((rgb, latent, alpha_one), dim=-1)
+
+    def _packed_background(self, device: torch.device, dtype: torch.dtype) -> Tensor:
+        c = 3 + self.config.field.feature_dim + 1
+        bg = torch.zeros(c, device=device, dtype=dtype)
+        bg[:3] = torch.tensor(self.config.render.bg_color, device=device, dtype=dtype)
+        return bg
+
+    def _render_inputs(self, field: dict[str, Tensor | None], R_cw: Tensor, t_cw: Tensor, intrinsics: Tensor):
+        viewmat = self._viewmat_from_pose(R_cw, t_cw)
+        K = self._K_from_intrinsics(intrinsics)
+        means3d = field["means3d"]
+        quat = field["quat"]
+        scale = field["scale"]
+        opacity = field["opacity"]
+        rgb = field["rgb"]
+        latent = field["latent"]
+        assert (
+            means3d is not None
+            and quat is not None
+            and scale is not None
+            and opacity is not None
+            and rgb is not None
+            and latent is not None
+        )
+        values = self._packed_values(rgb, latent)
+        background = self._packed_background(values.device, values.dtype)
+        return viewmat, K, means3d, quat, scale, opacity, values, background
+
+    def _prepare_render_payload_eager(
+        self,
+        base_intrinsics: Tensor,
+        render_intrinsics: Tensor,
+        R_cw: Tensor,
+        t_cw: Tensor,
+    ):
+        field = self.field_model(base_intrinsics, R_cw=R_cw, t_cw=t_cw)
+        viewmat, K, means3d, quat, scale, opacity, values, background = self._render_inputs(
+            field,
+            R_cw,
+            t_cw,
+            render_intrinsics,
+        )
+        return field, viewmat, K, means3d, quat, scale, opacity, values, background
+
+    def _render_stats_with_pose(
+        self,
+        field: dict[str, Tensor | None],
+        R_cw: Tensor,
+        t_cw: Tensor,
+        intrinsics: Tensor,
+        out_h: int,
+        out_w: int,
+        residual_map: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        viewmat, K, means3d, quat, scale, opacity, values, background = self._render_inputs(
+            field, R_cw, t_cw, intrinsics
+        )
+        return render_stats_warp(
+            means=means3d.contiguous(),
+            quat=quat.contiguous(),
+            scale=scale.contiguous(),
+            opacity=opacity.contiguous(),
+            viewmat=viewmat.contiguous(),
+            K=K.contiguous(),
+            width=out_w,
+            height=out_h,
+            cfg=self._renderer_config(),
+            residual_map=None if residual_map is None else residual_map.contiguous(),
+        )
+
+    def _render_stats_from_prepared(
+        self,
+        prepared: PreparedVisibility,
+        opacity: Tensor,
+        residual_map: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        return render_stats_prepared_warp(
+            prepared,
+            opacity=opacity.contiguous(),
+            cfg=self._renderer_config(),
+            residual_map=None if residual_map is None else residual_map.contiguous(),
+        )
+
+    def _meta_tuple(self, meta: dict[str, Tensor]) -> tuple[Tensor, ...]:
+        return tuple(meta[key] for key in _META_STAT_KEYS)
+
+    def _meta_dict(self, values: Sequence[Tensor]) -> dict[str, Tensor]:
+        return {key: value for key, value in zip(_META_STAT_KEYS, values, strict=True)}
+
+    def _density_stats_dict(self, values: Sequence[Tensor]) -> dict[str, Tensor]:
+        return {key: value for key, value in zip(_DENSITY_STAT_KEYS, values, strict=True)}
+
+    def _render_values_with_meta_eager(
+        self,
+        means: Tensor,
+        quat: Tensor,
+        scale: Tensor,
+        values: Tensor,
+        opacity: Tensor,
+        background: Tensor,
+        viewmat: Tensor,
+        K: Tensor,
+        out_h: int,
+        out_w: int,
+    ) -> tuple[Tensor, PreparedVisibility, tuple[Tensor, ...]]:
+        packed_hwc, prepared = render_values_warp(
+            means=means.contiguous(),
+            quat=quat.contiguous(),
+            scale=scale.contiguous(),
+            values=values.contiguous(),
+            opacity=opacity.contiguous(),
+            background=background.contiguous(),
+            viewmat=viewmat.contiguous(),
+            K=K.contiguous(),
+            width=out_w,
+            height=out_h,
+            cfg=self._renderer_config(),
+            return_prepared=True,
+        )
+        return packed_hwc, prepared, self._meta_tuple(prepared.meta())
+
+    def _render_density_stats_eager(
+        self,
+        prepared: PreparedVisibility,
+        opacity: Tensor,
+        residual_map: Tensor,
+    ) -> tuple[Tensor, ...]:
+        stats = render_stats_prepared_warp(
+            prepared,
+            opacity=opacity.contiguous(),
+            cfg=self._renderer_config(),
+            residual_map=residual_map.contiguous(),
+        )
+        return tuple(stats[key].detach() for key in _DENSITY_STAT_KEYS)
+
+    def _residual_map_for_render(self, pred_observed: Tensor, target: Tensor, render_h: int, render_w: int) -> Tensor:
+        residual = (pred_observed - target).abs().mean(dim=0, keepdim=True)
+        if residual.shape[-2:] != (render_h, render_w):
+            residual = torch.nn.functional.interpolate(
+                residual.unsqueeze(0),
+                size=(render_h, render_w),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+        return residual[0]
+
+    def _postprocess_rgb_eager(
+        self,
+        packed: Tensor,
+        out_h: int,
+        out_w: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        rgb = packed[:3]
+        latent = packed[3 : 3 + self.config.field.feature_dim]
+        alpha = packed[-1:].clamp(0.0, 1.0)
+
+        if self._residual_head_forward is not None:
+            scale_x = out_w / self.train_width
+            scale_y = out_h / self.train_height
+            residual = self._residual_head_forward(latent, scale_x=scale_x, scale_y=scale_y)
+            rgb = (rgb + alpha * residual).clamp(0.0, 1.0)
+        else:
+            rgb = rgb.clamp(0.0, 1.0)
+        return rgb, latent, alpha
+
+    def _regularization_field(self, field: dict[str, Tensor | None]) -> dict[str, Tensor | None]:
+        depth_map = field.get("depth_map")
+        opacity = field.get("opacity")
+        scale = field.get("scale")
+        return {
+            "depth_map": None if depth_map is None else depth_map.clone(),
+            "opacity": None if opacity is None else opacity.clone(),
+            "scale": None if scale is None else scale.clone(),
+        }
+
+    def _observe_and_photometric_loss_eager(self, rgb: Tensor, target: Tensor) -> tuple[Tensor, Tensor]:
+        pred = render_observe_rgb(
+            rgb,
+            int(target.shape[-2]),
+            int(target.shape[-1]),
+            self.config.observation,
+            layout="chw",
+        )
+        return pred, self._photometric_loss(pred, target)
+
+    def _training_view_forward_eager(
+        self,
+        base_intrinsics: Tensor,
+        render_intrinsics: Tensor,
+        R_cw: Tensor,
+        t_cw: Tensor,
+        target: Tensor,
+        out_h: int,
+        out_w: int,
+    ) -> tuple[Tensor, ...]:
+        _field, viewmat, K, means3d, quat, scale, opacity, values, background = self._prepare_render_payload(
+            base_intrinsics,
+            render_intrinsics,
+            R_cw,
+            t_cw,
+        )
+        packed_hwc, _prepared, meta = self._render_values_with_meta(
+            means3d,
+            quat,
+            scale,
+            values,
+            opacity,
+            background,
+            viewmat,
+            K,
+            out_h,
+            out_w,
+        )
+        packed = packed_hwc.permute(2, 0, 1).contiguous()
+        rgb, _latent, _alpha = self._postprocess_rgb(packed, out_h, out_w)
+        pred, photo_term = self._observe_and_photometric_loss(rgb, target)
+        return (photo_term, torch.isfinite(rgb).all(), torch.isfinite(pred).all(), *meta)
+
+    def _training_view_forward_density_eager(
+        self,
+        base_intrinsics: Tensor,
+        render_intrinsics: Tensor,
+        R_cw: Tensor,
+        t_cw: Tensor,
+        target: Tensor,
+        out_h: int,
+        out_w: int,
+    ) -> tuple[Tensor, ...]:
+        _field, viewmat, K, means3d, quat, scale, opacity, values, background = self._prepare_render_payload(
+            base_intrinsics,
+            render_intrinsics,
+            R_cw,
+            t_cw,
+        )
+        packed_hwc, prepared, meta = self._render_values_with_meta(
+            means3d,
+            quat,
+            scale,
+            values,
+            opacity,
+            background,
+            viewmat,
+            K,
+            out_h,
+            out_w,
+        )
+        packed = packed_hwc.permute(2, 0, 1).contiguous()
+        rgb, _latent, _alpha = self._postprocess_rgb(packed, out_h, out_w)
+        pred, photo_term = self._observe_and_photometric_loss(rgb, target)
+        residual_map = self._residual_map_for_render(pred, target, out_h, out_w)
+        density_stats = self._render_density_stats(prepared, opacity, residual_map)
+        return (photo_term, torch.isfinite(rgb).all(), torch.isfinite(pred).all(), *meta, *density_stats)
+
+    def _train_step_all_views_eager(
+        self,
+        opt: torch.optim.Optimizer,
+        stage_targets: Tensor,
+        out_h: int,
+        out_w: int,
+        stage_alpha: float,
+        grad_clip: float,
+    ) -> tuple[Tensor, ...]:
+        opt.zero_grad(set_to_none=True)
+        base_intrinsics = self.intrinsics.get()
+        render_intrinsics = self._scale_intrinsics(out_h, out_w)
+        R_all, t_all = self.camera_model.world_to_camera()
+        photo_loss = stage_targets.new_tensor(0.0)
+        rgb_finite = torch.ones((), device=stage_targets.device, dtype=torch.bool)
+        pred_finite = torch.ones((), device=stage_targets.device, dtype=torch.bool)
+        for view_index in range(self.num_views):
+            train_view = self._training_view_forward_eager(
+                base_intrinsics,
+                render_intrinsics,
+                R_all[view_index],
+                t_all[view_index],
+                stage_targets[view_index],
+                out_h,
+                out_w,
+            )
+            photo_loss = photo_loss + train_view[0]
+            rgb_finite = rgb_finite & train_view[1]
+            pred_finite = pred_finite & train_view[2]
+        photo_loss = photo_loss / float(max(self.num_views, 1))
+        reg_loss = self._regularization(None, stage_alpha)
+        loss = photo_loss + reg_loss
+        loss.backward()
+        if grad_clip > 0.0:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), grad_clip)
+        opt.step()
+        return loss.detach(), photo_loss.detach(), reg_loss.detach(), rgb_finite.detach(), pred_finite.detach()
+
+    def _train_step_all_views_density_eager(
+        self,
+        opt: torch.optim.Optimizer,
+        stage_targets: Tensor,
+        out_h: int,
+        out_w: int,
+        stage_alpha: float,
+        grad_clip: float,
+    ) -> tuple[Tensor, ...]:
+        opt.zero_grad(set_to_none=True)
+        base_intrinsics = self.intrinsics.get()
+        render_intrinsics = self._scale_intrinsics(out_h, out_w)
+        R_all, t_all = self.camera_model.world_to_camera()
+        photo_loss = stage_targets.new_tensor(0.0)
+        rgb_finite = torch.ones((), device=stage_targets.device, dtype=torch.bool)
+        pred_finite = torch.ones((), device=stage_targets.device, dtype=torch.bool)
+        stats_accum: dict[str, Tensor] | None = None
+        meta_offset = 3 + len(_META_STAT_KEYS)
+        for view_index in range(self.num_views):
+            train_view = self._training_view_forward_density_eager(
+                base_intrinsics,
+                render_intrinsics,
+                R_all[view_index],
+                t_all[view_index],
+                stage_targets[view_index],
+                out_h,
+                out_w,
+            )
+            photo_loss = photo_loss + train_view[0]
+            rgb_finite = rgb_finite & train_view[1]
+            pred_finite = pred_finite & train_view[2]
+            stats_accum = self._accumulate_render_stats(stats_accum, self._density_stats_dict(train_view[meta_offset:]))
+        photo_loss = photo_loss / float(max(self.num_views, 1))
+        reg_loss = self._regularization(None, stage_alpha)
+        loss = photo_loss + reg_loss
+        loss.backward()
+        if grad_clip > 0.0:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), grad_clip)
+        opt.step()
+        assert stats_accum is not None
+        return (
+            loss.detach(),
+            photo_loss.detach(),
+            reg_loss.detach(),
+            rgb_finite.detach(),
+            pred_finite.detach(),
+            *(stats_accum[key].detach() for key in _DENSITY_STAT_KEYS),
+        )
+
+    def render_with_pose(
+        self,
+        R_cw: Tensor,
+        t_cw: Tensor,
+        out_h: int,
+        out_w: int,
+        return_aux: bool = True,
+        stats_mode: str = "full",
+        return_prepared: bool = False,
+        profile: bool = False,
+    ) -> dict[str, object]:
+        if stats_mode not in {"meta", "full"}:
+            raise ValueError(f"stats_mode must be 'meta' or 'full', got {stats_mode!r}")
+        intr = self._scale_intrinsics(out_h, out_w)
+        timing_device = R_cw.device
+        field_s = 0.0
+        render_s = 0.0
+        aux_stats_s = 0.0
+        base_intr = self.intrinsics.get()
+        if profile:
+            self._sync_for_timing(timing_device)
+            t0 = time.perf_counter()
+        with torch.profiler.record_function("pipeline.render.prepare_field"):
+            field, viewmat, K, means3d, quat, scale, opacity, values, background = self._prepare_render_payload(
+                base_intr,
+                intr,
+                R_cw,
+                t_cw,
+            )
+        means_render = means3d.contiguous()
+        quat_render = quat.contiguous()
+        scale_render = scale.contiguous()
+        opacity_render = opacity.contiguous()
+        values_render = values.contiguous()
+        background_render = background.contiguous()
+        viewmat_render = viewmat.contiguous()
+        K_render = K.contiguous()
+        if profile:
+            self._sync_for_timing(timing_device)
+            field_s = time.perf_counter() - t0
+            t0 = time.perf_counter()
+        renderer_cfg = self._renderer_config()
+        with torch.profiler.record_function("pipeline.render.warp"):
+            render_result = render_values_warp(
+                means=means_render,
+                quat=quat_render,
+                scale=scale_render,
+                values=values_render,
+                opacity=opacity_render,
+                background=background_render,
+                viewmat=viewmat_render,
+                K=K_render,
+                width=out_w,
+                height=out_h,
+                cfg=renderer_cfg,
+                return_prepared=return_aux,
+            )
+        if return_aux:
+            packed_hwc, prepared = render_result
+        else:
+            packed_hwc = render_result
+            prepared = None
+        if profile:
+            self._sync_for_timing(timing_device)
+            render_s = time.perf_counter() - t0
+        with torch.profiler.record_function("pipeline.render.postprocess"):
+            packed = packed_hwc.permute(2, 0, 1).contiguous()
+            rgb, latent, alpha = self._postprocess_rgb(packed, out_h, out_w)
+
+        result: dict[str, object] = {"rgb": rgb}
+        if return_aux:
+            if profile:
+                self._sync_for_timing(timing_device)
+                t0 = time.perf_counter()
+            assert prepared is not None
+            with torch.profiler.record_function("pipeline.render.aux_stats"):
+                if stats_mode == "meta":
+                    render_stats = prepared.meta()
+                else:
+                    render_stats = render_stats_prepared_warp(prepared, opacity=opacity_render, cfg=renderer_cfg)
+            if profile:
+                self._sync_for_timing(timing_device)
+                aux_stats_s = time.perf_counter() - t0
+            result.update({
+                "alpha": alpha,
+                "latent": latent,
+                "field": self._regularization_field(field),
+                "packed": packed,
+                "render_stats": render_stats,
+            })
+            if return_prepared:
+                result["_prepared_visibility"] = prepared
+                result["_opacity"] = opacity_render
+        if profile:
+            result["profile"] = {
+                "field_s": field_s,
+                "render_s": render_s,
+                "aux_stats_s": aux_stats_s,
+            }
+        return result
+
+    def render_view(
+        self,
+        view_index: int,
+        scale: float | None = None,
+        out_size: tuple[int, int] | None = None,
+        return_aux: bool = True,
+        stats_mode: str = "full",
+    ) -> dict[str, Tensor | dict[str, Tensor | None] | dict[str, Tensor]]:
+        if out_size is None:
+            s = 1.0 if scale is None else float(scale)
+            out_h = max(1, int(round(self.train_height * s)))
+            out_w = max(1, int(round(self.train_width * s)))
+        else:
+            out_h, out_w = int(out_size[0]), int(out_size[1])
+
+        R_all, t_all = self.camera_model.world_to_camera()
+        return self.render_with_pose(
+            R_all[view_index],
+            t_all[view_index],
+            out_h,
+            out_w,
+            return_aux=return_aux,
+            stats_mode=stats_mode,
+        )
+
+    def render_view_meta(
+        self,
+        view_index: int,
+        scale: float | None = None,
+        out_size: tuple[int, int] | None = None,
+    ) -> dict[str, Tensor]:
+        if out_size is None:
+            s = 1.0 if scale is None else float(scale)
+            out_h = max(1, int(round(self.train_height * s)))
+            out_w = max(1, int(round(self.train_width * s)))
+        else:
+            out_h, out_w = int(out_size[0]), int(out_size[1])
+
+        base_intrinsics = self.intrinsics.get()
+        render_intrinsics = self._scale_intrinsics(out_h, out_w)
+        R_all, t_all = self.camera_model.world_to_camera()
+        _field, viewmat, K, means3d, quat, scale_render, _opacity, _values, _background = (
+            self._prepare_render_payload_eager(
+                base_intrinsics,
+                render_intrinsics,
+                R_all[view_index],
+                t_all[view_index],
+            )
+        )
+        return render_visibility_meta_warp(
+            means=means3d.contiguous(),
+            quat=quat.contiguous(),
+            scale=scale_render.contiguous(),
+            viewmat=viewmat.contiguous(),
+            K=K.contiguous(),
+            width=out_w,
+            height=out_h,
+            cfg=self._renderer_config(),
+        )
+
+    def _photometric_loss(self, pred: Tensor, target: Tensor) -> Tensor:
+        l1 = charbonnier(pred - target).mean()
+        if self.config.train.photometric_ssim_weight > 0.0:
+            ssim_l = 1.0 - ssim_value(pred, target)
+        else:
+            ssim_l = pred.new_tensor(0.0)
+        return self.config.train.photometric_l1_weight * l1 + self.config.train.photometric_ssim_weight * ssim_l
+
+    def _regularization(self, field: dict[str, Tensor | None] | None, stage_alpha: float) -> Tensor:
+        depth_map = None if field is None else field.get("depth_map")
+        opacity = None if field is None else field.get("opacity")
+        scale = None if field is None else field.get("scale")
+        if depth_map is None:
+            depth = torch.nn.functional.softplus(self.field_model.depth_raw) + self.field_model.field_cfg.min_depth
+            if int(depth.shape[0]) == int(self.field_model.gh * self.field_model.gw):
+                depth_map = depth.view(self.field_model.gh, self.field_model.gw)
+        if opacity is None:
+            opacity = torch.sigmoid(self.field_model.opacity_logit[:, 0])
+        if scale is None:
+            scale = torch.exp(self.field_model.log_scale)
+        if depth_map is None:
+            depth_tv = torch.zeros((), device=self.intrinsics.log_fx.device, dtype=self.intrinsics.log_fx.dtype)
+        else:
+            depth_tv = tv_loss_grid(depth_map)
+        opacity_reg = opacity.mean()
+        scale_reg = scale.mean()
+        pose_reg_weight = (
+            1.0 - stage_alpha
+        ) * self.config.train.pose_weight_stage0 + stage_alpha * self.config.train.pose_weight_final
+        pose_reg = self.camera_model.pose_regularizer()
+        return (
+            self.config.train.depth_tv_weight * depth_tv
+            + self.config.train.opacity_weight * opacity_reg
+            + self.config.train.scale_weight * scale_reg
+            + pose_reg_weight * pose_reg
+        )
+
+    def _accumulate_render_stats(
+        self, accum: dict[str, Tensor] | None, render_stats: dict[str, Tensor]
+    ) -> dict[str, Tensor]:
+        render_stats = {k: v for k, v in render_stats.items() if not k.startswith("meta_")}
+        if accum is None:
+            return {k: v.detach().clone() for k, v in render_stats.items()}
+        return {k: accum[k] + render_stats[k].detach() for k in accum.keys()}
+
+    def _sync_for_timing(self, device: torch.device) -> None:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device=device)
+
+    def _cudagraph_mark_step_begin(self) -> None:
+        compiler = getattr(torch, "compiler", None)
+        fn = getattr(compiler, "cudagraph_mark_step_begin", None)
+        if callable(fn):
+            fn()
+
+    def _memory_snapshot(self, device: torch.device) -> dict[str, float]:
+        if device.type != "cuda":
+            return {
+                "cuda_alloc_gib": 0.0,
+                "cuda_reserved_gib": 0.0,
+                "cuda_max_alloc_gib": 0.0,
+            }
+        denom = float(1024**3)
+        return {
+            "cuda_alloc_gib": float(torch.cuda.memory_allocated(device) / denom),
+            "cuda_reserved_gib": float(torch.cuda.memory_reserved(device) / denom),
+            "cuda_max_alloc_gib": float(torch.cuda.max_memory_allocated(device) / denom),
+        }
+
+    def _render_stats_summary(self, render_stats: dict[str, Tensor]) -> dict[str, int]:
+        def _scalar(name: str) -> int:
+            value = render_stats.get(name)
+            if value is None:
+                return 0
+            return int(value.item())
+
+        return {
+            "gaussian_count": _scalar("meta_gaussian_count"),
+            "visible_count": _scalar("meta_visible_count"),
+            "intersection_count": _scalar("meta_intersection_count"),
+            "tile_count": _scalar("meta_tile_count"),
+            "tiles_x": _scalar("meta_tiles_x"),
+            "tiles_y": _scalar("meta_tiles_y"),
+            "render_width": _scalar("meta_render_width"),
+            "render_height": _scalar("meta_render_height"),
+        }
+
+    def _format_eta(self, seconds: float) -> str:
+        seconds_i = max(int(round(seconds)), 0)
+        hours = seconds_i // 3600
+        minutes = (seconds_i % 3600) // 60
+        secs = seconds_i % 60
+        if hours > 0:
+            return f"{hours}h{minutes:02d}m{secs:02d}s"
+        if minutes > 0:
+            return f"{minutes}m{secs:02d}s"
+        return f"{secs}s"
+
+    def _timestamp(self) -> str:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+    def _progress_print(self, message: str) -> None:
+        print(f"[{self._timestamp()}] {message}", flush=True)
+
+    def _tensor_nonfinite_count(self, value: Tensor | None) -> int:
+        if value is None:
+            return 0
+        finite = torch.isfinite(value)
+        return int((~finite).sum().item())
+
+    def _monitored_parameter_items(self) -> list[tuple[str, Tensor]]:
+        items: list[tuple[str, Tensor]] = [
+            ("depth_raw", self.field_model.depth_raw),
+            ("xyz_offset", self.field_model.xyz_offset),
+            ("quat_raw", self.field_model.quat_raw),
+            ("log_scale", self.field_model.log_scale),
+            ("opacity_logit", self.field_model.opacity_logit),
+            ("rgb_logit", self.field_model.rgb_logit),
+            ("latent", self.field_model.latent),
+            ("camera_pose", self.camera_model.pose_rest),
+            ("intrinsics_log_fx", self.intrinsics.log_fx),
+            ("intrinsics_log_fy", self.intrinsics.log_fy),
+            ("intrinsics_cx", self.intrinsics.cx),
+            ("intrinsics_cy", self.intrinsics.cy),
+        ]
+        if getattr(self.field_model, "sh_coeffs", None) is not None:
+            items.append(("sh_coeffs", self.field_model.sh_coeffs))
+        if self.residual_head is not None:
+            for name, param in self.residual_head.named_parameters():
+                items.append((f"residual_head.{name}", param))
+        return items
+
+    def _parameter_nonfinite_report(self) -> dict[str, int]:
+        report = {name: self._tensor_nonfinite_count(param) for name, param in self._monitored_parameter_items()}
+        return {k: v for k, v in report.items() if v > 0}
+
+    def _gradient_stats_report(self) -> dict[str, dict[str, float | int]]:
+        report: dict[str, dict[str, float | int]] = {}
+        for name, param in self._monitored_parameter_items():
+            grad = param.grad
+            if grad is None:
+                continue
+            grad_detached = grad.detach()
+            finite_mask = torch.isfinite(grad_detached)
+            nonfinite_count = int((~finite_mask).sum().item())
+            finite_vals = grad_detached[finite_mask]
+            if finite_vals.numel() > 0:
+                abs_vals = finite_vals.abs()
+                max_abs = float(abs_vals.max().item())
+                mean_abs = float(abs_vals.mean().item())
+                l2_norm = float(torch.linalg.vector_norm(finite_vals).item())
+            else:
+                max_abs = float("nan")
+                mean_abs = float("nan")
+                l2_norm = float("nan")
+            report[name] = {
+                "nonfinite": nonfinite_count,
+                "max_abs": max_abs,
+                "mean_abs": mean_abs,
+                "l2_norm": l2_norm,
+            }
+        return report
+
+    def _gradient_nonfinite_report(self) -> dict[str, int]:
+        report = self._gradient_stats_report()
+        return {name: int(stats["nonfinite"]) for name, stats in report.items() if int(stats["nonfinite"]) > 0}
+
+    def _raise_nonfinite(
+        self,
+        kind: str,
+        stage_idx: int,
+        step_idx: int,
+        global_step: int,
+        extra: dict[str, object] | None = None,
+    ) -> None:
+        payload: dict[str, object] = {
+            "kind": kind,
+            "stage_index": int(stage_idx),
+            "step_index": int(step_idx),
+            "global_step": int(global_step),
+            "nonfinite_params": self._parameter_nonfinite_report(),
+        }
+        if extra:
+            payload.update(extra)
+        raise FloatingPointError(f"Non-finite state detected: {payload}")
+
+    def fit(
+        self,
+        images: Tensor,
+        train_cfg: TrainConfig | None = None,
+        density_event_log_path: str | Path | None = None,
+        density_event_callback: Callable[[dict], None] | None = None,
+        verbose_progress: bool = False,
+        progress_log_path: str | Path | None = None,
+        progress_event_callback: Callable[[dict], None] | None = None,
+        synchronize_progress_timing: bool = False,
+        step_callback: Callable[[int, int, int], None] | None = None,
+    ) -> dict[str, list]:
+        train_cfg = train_cfg or self.config.train
+        if images.shape[0] != self.num_views:
+            raise ValueError("Number of images does not match pipeline initialization.")
+        if images.shape[-2] != self.train_height or images.shape[-1] != self.train_width:
+            raise ValueError("Training images must match initialization resolution.")
+
+        opt = self._make_optimizer(train_cfg)
+        history: dict[str, list] = {"loss": [], "photo": [], "reg": [], "num_gaussians": [], "density_events": []}
+        total_stages = len(train_cfg.stage_scales)
+        if len(train_cfg.steps_per_stage) != total_stages:
+            raise ValueError("steps_per_stage must have the same length as stage_scales.")
+
+        progress_enabled = bool(
+            verbose_progress or progress_log_path is not None or progress_event_callback is not None
+        )
+        debug_progress_enabled = bool(verbose_progress)
+        timing_enabled = bool(synchronize_progress_timing or verbose_progress)
+        run_start = time.perf_counter()
+
+        def _emit_progress(event: dict) -> None:
+            if not progress_enabled:
+                return
+            payload = {
+                "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "elapsed_s": float(time.perf_counter() - run_start),
+                **event,
+            }
+            emit_progress_event(
+                payload,
+                jsonl_path=progress_log_path,
+                callback=progress_event_callback,
+            )
+
+        global_step = 0
+        for stage_idx, stage_scale in enumerate(train_cfg.stage_scales):
+            steps = train_cfg.steps_per_stage[stage_idx]
+            stage_h = max(1, int(round(self.train_height * float(stage_scale))))
+            stage_w = max(1, int(round(self.train_width * float(stage_scale))))
+            render_h, render_w = observation_render_size(stage_h, stage_w, self.config.observation)
+            stage_targets = (
+                images
+                if (stage_h == self.train_height and stage_w == self.train_width)
+                else torch.nn.functional.interpolate(images, size=(stage_h, stage_w), mode="area")
+            )
+            stage_alpha = 0.0 if total_stages == 1 else stage_idx / (total_stages - 1)
+            stage_start_time = time.perf_counter()
+
+            _emit_progress({
+                "event": "stage_start",
+                "stage_index": int(stage_idx),
+                "stage_scale": float(stage_scale),
+                "steps": int(steps),
+                "stage_height": int(stage_h),
+                "stage_width": int(stage_w),
+                "render_height": int(render_h),
+                "render_width": int(render_w),
+                "num_gaussians": int(self.field_model.num_gaussians),
+            })
+            if verbose_progress:
+                self._progress_print(
+                    f"[stage-start] stage={stage_idx + 1}/{total_stages} scale={stage_scale:.2f} "
+                    f"stage={stage_h}x{stage_w} render={render_h}x{render_w} "
+                    f"N={self.field_model.num_gaussians}"
+                )
+
+            for step in range(steps):
+                with torch.profiler.record_function("pipeline.step"):
+                    step_start_time = time.perf_counter()
+                    if not timing_enabled:
+                        self._cudagraph_mark_step_begin()
+                    density_due = should_run_density_control_for_stage(
+                        global_step,
+                        self.config.density,
+                        stage_idx,
+                        total_stages,
+                    )
+                    R_all, t_all = self.camera_model.world_to_camera()
+                    if train_cfg.view_batch_size and train_cfg.view_batch_size < self.num_views:
+                        perm = torch.randperm(self.num_views, device=images.device)
+                        view_ids = perm[: train_cfg.view_batch_size].tolist()
+                    else:
+                        view_ids = list(range(self.num_views))
+                    full_view_batch = len(view_ids) == self.num_views
+                    use_compiled_train_step = bool(
+                        not debug_progress_enabled and not timing_enabled and full_view_batch
+                    )
+
+                    _emit_progress({
+                        "event": "step_start",
+                        "stage_index": int(stage_idx),
+                        "step_index": int(step),
+                        "global_step": int(global_step),
+                        "steps_in_stage": int(steps),
+                        "views_in_step": int(len(view_ids)),
+                        "render_height": int(render_h),
+                        "render_width": int(render_w),
+                        "density_due": bool(density_due),
+                        "num_gaussians": int(self.field_model.num_gaussians),
+                    })
+                    if verbose_progress:
+                        self._progress_print(
+                            f"[step-start] stage={stage_idx + 1}/{total_stages} "
+                            f"step={step + 1}/{steps} global={global_step} "
+                            f"views={len(view_ids)} render={render_h}x{render_w} "
+                            f"N={self.field_model.num_gaussians} density_due={int(density_due)}"
+                        )
+
+                    photo_loss = images.new_tensor(0.0)
+                    rendered_any = False
+                    stats_accum: dict[str, Tensor] | None = None
+                    per_view_observations: list[DensityViewObservation] = []
+                    field_total_s = 0.0
+                    render_total_s = 0.0
+                    aux_stats_total_s = 0.0
+                    residual_stats_total_s = 0.0
+                    view_total_s = 0.0
+                    backward_s = 0.0
+                    opt_step_s = 0.0
+
+                    if use_compiled_train_step and not density_due:
+                        with torch.profiler.record_function("pipeline.train_step_compiled"):
+                            step_out = self._train_step_all_views(
+                                opt,
+                                stage_targets,
+                                render_h,
+                                render_w,
+                                stage_alpha,
+                                train_cfg.grad_clip,
+                            )
+                        loss = step_out[0].clone()
+                        photo_loss = step_out[1].clone()
+                        reg_loss = step_out[2].clone()
+                        if not bool(step_out[3].item()):
+                            self._raise_nonfinite("render_rgb", stage_idx, step, global_step)
+                        if not bool(step_out[4].item()):
+                            self._raise_nonfinite("observed_prediction", stage_idx, step, global_step)
+                        rendered_any = True
+                    else:
+                        opt.zero_grad(set_to_none=True)
+                        base_intr = self.intrinsics.get()
+                        intr = self._scale_intrinsics(render_h, render_w)
+
+                        for view_pos, v in enumerate(view_ids):
+                            with torch.profiler.record_function("pipeline.view"):
+                                if verbose_progress:
+                                    self._progress_print(
+                                        f"[view-start] stage={stage_idx + 1}/{total_stages} "
+                                        f"step={step + 1}/{steps} view={view_pos + 1}/{len(view_ids)} "
+                                        f"vid={v} render={render_h}x{render_w} N={self.field_model.num_gaussians}"
+                                    )
+                                _emit_progress({
+                                    "event": "view_start",
+                                    "stage_index": int(stage_idx),
+                                    "step_index": int(step),
+                                    "global_step": int(global_step),
+                                    "view_index": int(v),
+                                    "view_ordinal": int(view_pos),
+                                    "views_in_step": int(len(view_ids)),
+                                    "num_gaussians": int(self.field_model.num_gaussians),
+                                })
+                                view_start = time.perf_counter()
+                                render_profile: dict[str, float] = {}
+                                residual_stats_s = 0.0
+                                tgt = stage_targets[v]
+                                if timing_enabled or debug_progress_enabled:
+                                    render = self.render_with_pose(
+                                        R_all[v],
+                                        t_all[v],
+                                        render_h,
+                                        render_w,
+                                        return_aux=True,
+                                        stats_mode="meta",
+                                        return_prepared=density_due,
+                                        profile=timing_enabled,
+                                    )
+                                    with torch.profiler.record_function("pipeline.observe_and_photometric_loss"):
+                                        pred, photo_term = self._observe_and_photometric_loss(render["rgb"], tgt)
+                                    if not torch.isfinite(render["rgb"]).all():
+                                        self._raise_nonfinite(
+                                            "render_rgb",
+                                            stage_idx,
+                                            step,
+                                            global_step,
+                                            {
+                                                "view_index": int(v),
+                                                "view_ordinal": int(view_pos),
+                                            },
+                                        )
+                                    if not torch.isfinite(pred).all():
+                                        self._raise_nonfinite(
+                                            "observed_prediction",
+                                            stage_idx,
+                                            step,
+                                            global_step,
+                                            {
+                                                "view_index": int(v),
+                                                "view_ordinal": int(view_pos),
+                                            },
+                                        )
+                                    photo_loss = photo_loss + photo_term
+                                    render_profile = (
+                                        render.get("profile", {}) if isinstance(render.get("profile"), dict) else {}
+                                    )
+                                    field_total_s += float(render_profile.get("field_s", 0.0))
+                                    render_total_s += float(render_profile.get("render_s", 0.0))
+                                    aux_stats_total_s += float(render_profile.get("aux_stats_s", 0.0))
+                                    if density_due:
+                                        if timing_enabled:
+                                            self._sync_for_timing(images.device)
+                                        residual_stats_start = time.perf_counter()
+                                        with torch.profiler.record_function("pipeline.residual_stats"):
+                                            residual_map = self._residual_map_for_render(pred, tgt, render_h, render_w)
+                                            residual_stats = self._render_stats_from_prepared(
+                                                render["_prepared_visibility"],
+                                                render["_opacity"],
+                                                residual_map=residual_map,
+                                            )
+                                        if timing_enabled:
+                                            self._sync_for_timing(images.device)
+                                            residual_stats_s = time.perf_counter() - residual_stats_start
+                                        stats_accum = self._accumulate_render_stats(stats_accum, residual_stats)
+                                    else:
+                                        stats_accum = self._accumulate_render_stats(stats_accum, render["render_stats"])
+                                    render_summary = self._render_stats_summary(render["render_stats"])
+                                    if density_due:
+                                        per_view_observations.append(
+                                            DensityViewObservation(
+                                                coverage=DensityViewCoverage(
+                                                    view_index=int(v),
+                                                    visible_count=int(render_summary["visible_count"]),
+                                                    intersection_count=int(render_summary["intersection_count"]),
+                                                    render_width=int(render_summary["render_width"]),
+                                                    render_height=int(render_summary["render_height"]),
+                                                ),
+                                                render_stats=residual_stats,
+                                            )
+                                        )
+                                else:
+                                    with torch.profiler.record_function("pipeline.training_view_forward"):
+                                        if density_due:
+                                            train_view = self._training_view_forward_density(
+                                                base_intr,
+                                                intr,
+                                                R_all[v],
+                                                t_all[v],
+                                                tgt,
+                                                render_h,
+                                                render_w,
+                                            )
+                                            meta_offset = 3 + len(_META_STAT_KEYS)
+                                            residual_stats = self._density_stats_dict(train_view[meta_offset:])
+                                            stats_accum = self._accumulate_render_stats(stats_accum, residual_stats)
+                                        else:
+                                            train_view = self._training_view_forward(
+                                                base_intr,
+                                                intr,
+                                                R_all[v],
+                                                t_all[v],
+                                                tgt,
+                                                render_h,
+                                                render_w,
+                                            )
+                                            meta_offset = 3 + len(_META_STAT_KEYS)
+                                            stats_accum = self._accumulate_render_stats(
+                                                stats_accum,
+                                                self._meta_dict(train_view[3:meta_offset]),
+                                            )
+                                    photo_term = train_view[0].clone()
+                                    rgb_finite = bool(train_view[1].item())
+                                    pred_finite = bool(train_view[2].item())
+                                    if not rgb_finite:
+                                        self._raise_nonfinite(
+                                            "render_rgb",
+                                            stage_idx,
+                                            step,
+                                            global_step,
+                                            {
+                                                "view_index": int(v),
+                                                "view_ordinal": int(view_pos),
+                                            },
+                                        )
+                                    if not pred_finite:
+                                        self._raise_nonfinite(
+                                            "observed_prediction",
+                                            stage_idx,
+                                            step,
+                                            global_step,
+                                            {
+                                                "view_index": int(v),
+                                                "view_ordinal": int(view_pos),
+                                            },
+                                        )
+                                    photo_loss = photo_loss + photo_term
+                                    render_summary = self._render_stats_summary(
+                                        self._meta_dict(train_view[3:meta_offset])
+                                    )
+                                    if density_due:
+                                        per_view_observations.append(
+                                            DensityViewObservation(
+                                                coverage=DensityViewCoverage(
+                                                    view_index=int(v),
+                                                    visible_count=int(render_summary["visible_count"]),
+                                                    intersection_count=int(render_summary["intersection_count"]),
+                                                    render_width=int(render_summary["render_width"]),
+                                                    render_height=int(render_summary["render_height"]),
+                                                ),
+                                                render_stats=residual_stats,
+                                            )
+                                        )
+                                rendered_any = True
+                                residual_stats_total_s += residual_stats_s
+                                view_elapsed_s = time.perf_counter() - view_start
+                                view_total_s += view_elapsed_s
+                                memory_snapshot = self._memory_snapshot(images.device)
+                                cumulative_photo = float(photo_loss.detach().item())
+                                _emit_progress({
+                                    "event": "view_end",
+                                    "stage_index": int(stage_idx),
+                                    "step_index": int(step),
+                                    "global_step": int(global_step),
+                                    "view_index": int(v),
+                                    "view_ordinal": int(view_pos),
+                                    "views_in_step": int(len(view_ids)),
+                                    "field_s": float(render_profile.get("field_s", 0.0)),
+                                    "render_s": float(render_profile.get("render_s", 0.0)),
+                                    "aux_stats_s": float(render_profile.get("aux_stats_s", 0.0)),
+                                    "residual_stats_s": float(residual_stats_s),
+                                    "view_total_s": float(view_elapsed_s),
+                                    "cumulative_photo_loss": cumulative_photo,
+                                    **render_summary,
+                                    **memory_snapshot,
+                                })
+                                if verbose_progress:
+                                    self._progress_print(
+                                        f"[view] stage={stage_idx + 1}/{total_stages} step={step + 1}/{steps} "
+                                        f"view={view_pos + 1}/{len(view_ids)} vid={v} "
+                                        f"N={render_summary['gaussian_count']} visible={render_summary['visible_count']} "
+                                        f"M={render_summary['intersection_count']} "
+                                        f"tiles={render_summary['tiles_x']}x{render_summary['tiles_y']} "
+                                        f"field={float(render_profile.get('field_s', 0.0)):.2f}s "
+                                        f"render={float(render_profile.get('render_s', 0.0)):.2f}s "
+                                        f"aux={float(render_profile.get('aux_stats_s', 0.0)):.2f}s "
+                                        f"residual={residual_stats_s:.2f}s "
+                                        f"photo_cum={cumulative_photo:.6f} "
+                                        f"cuda_alloc={memory_snapshot['cuda_alloc_gib']:.2f}GiB "
+                                        f"cuda_max={memory_snapshot['cuda_max_alloc_gib']:.2f}GiB"
+                                    )
+
+                        photo_loss = photo_loss / max(len(view_ids), 1)
+                        if not rendered_any:
+                            raise RuntimeError("No views were rendered during training step.")
+                        reg_loss = self._regularization_impl(None, stage_alpha)
+                        loss = photo_loss + reg_loss
+                        if not torch.isfinite(photo_loss):
+                            self._raise_nonfinite("photo_loss", stage_idx, step, global_step)
+                        if not torch.isfinite(reg_loss):
+                            self._raise_nonfinite("reg_loss", stage_idx, step, global_step)
+                        if not torch.isfinite(loss):
+                            self._raise_nonfinite("loss", stage_idx, step, global_step)
+
+                        backward_start = time.perf_counter()
+                        if timing_enabled:
+                            self._sync_for_timing(images.device)
+                            backward_start = time.perf_counter()
+                        with torch.profiler.record_function("pipeline.backward"):
+                            loss.backward()
+                        if timing_enabled:
+                            self._sync_for_timing(images.device)
+                            backward_s = time.perf_counter() - backward_start
+                        if train_cfg.grad_clip > 0:
+                            torch.nn.utils.clip_grad_norm_(self.parameters(), train_cfg.grad_clip)
+                        opt_step_start = time.perf_counter()
+                        if timing_enabled:
+                            self._sync_for_timing(images.device)
+                            opt_step_start = time.perf_counter()
+                        with torch.profiler.record_function("pipeline.optimizer_step"):
+                            opt.step()
+                        if timing_enabled:
+                            self._sync_for_timing(images.device)
+                            opt_step_s = time.perf_counter() - opt_step_start
+
+                    if not torch.isfinite(photo_loss):
+                        self._raise_nonfinite("photo_loss", stage_idx, step, global_step)
+                    if not torch.isfinite(reg_loss):
+                        self._raise_nonfinite("reg_loss", stage_idx, step, global_step)
+                    if not torch.isfinite(loss):
+                        self._raise_nonfinite("loss", stage_idx, step, global_step)
+
+                    gradient_stats = self._gradient_stats_report()
+                    gradient_nonfinite = {
+                        name: int(stats["nonfinite"])
+                        for name, stats in gradient_stats.items()
+                        if int(stats["nonfinite"]) > 0
+                    }
+                    _emit_progress({
+                        "event": "gradient_stats",
+                        "stage_index": int(stage_idx),
+                        "step_index": int(step),
+                        "global_step": int(global_step),
+                        "gradient_stats": gradient_stats,
+                    })
+                    if gradient_nonfinite:
+                        self._raise_nonfinite(
+                            "gradients_after_backward",
+                            stage_idx,
+                            step,
+                            global_step,
+                            {
+                                "nonfinite_grads": gradient_nonfinite,
+                                "gradient_stats": gradient_stats,
+                            },
+                        )
+                    nonfinite_params = self._parameter_nonfinite_report()
+                    if nonfinite_params:
+                        self._raise_nonfinite(
+                            "parameters_after_opt_step",
+                            stage_idx,
+                            step,
+                            global_step,
+                            {"nonfinite_params": nonfinite_params},
+                        )
+
+                    density_event = DensityControlResult.skipped(self.field_model.num_gaussians)
+                    density_s = 0.0
+                    if density_due:
+                        density_start = time.perf_counter()
+                        with torch.profiler.record_function("pipeline.density_control"):
+                            density_event = apply_density_control(
+                                self.field_model,
+                                self.config.density,
+                                global_step,
+                                render_stats=stats_accum,
+                                per_view_observations=per_view_observations,
+                            )
+                        density_s = time.perf_counter() - density_start
+                    if density_event.changed:
+                        opt = self._make_optimizer(train_cfg)
+                    if density_event.ran:
+                        event_record = {
+                            "global_step": int(global_step),
+                            "stage_index": int(stage_idx),
+                            "step_index": int(step),
+                            "summary": density_event.debug_dict(),
+                            "pruned": int(density_event.pruned),
+                            "split": int(density_event.split),
+                            "cloned": int(density_event.cloned),
+                            "before": int(density_event.before),
+                            "after": int(density_event.after),
+                        }
+                        history["density_events"].append(event_record)
+                        emit_density_event(
+                            event_record,
+                            jsonl_path=density_event_log_path,
+                            callback=density_event_callback,
+                        )
+
+                    step_total_s = time.perf_counter() - step_start_time
+                    stage_elapsed_s = time.perf_counter() - stage_start_time
+                    eta_stage_s = (stage_elapsed_s / float(step + 1)) * float(steps - step - 1)
+                    memory_snapshot = self._memory_snapshot(images.device)
+                    _emit_progress({
+                        "event": "step_end",
+                        "stage_index": int(stage_idx),
+                        "step_index": int(step),
+                        "global_step": int(global_step),
+                        "render_height": int(render_h),
+                        "render_width": int(render_w),
+                        "steps_in_stage": int(steps),
+                        "views_in_step": int(len(view_ids)),
+                        "loss": float(loss.detach().item()),
+                        "photo_loss": float(photo_loss.detach().item()),
+                        "reg_loss": float(reg_loss.detach().item()),
+                        "num_gaussians": int(self.field_model.num_gaussians),
+                        "view_total_s": float(view_total_s),
+                        "field_total_s": float(field_total_s),
+                        "render_total_s": float(render_total_s),
+                        "aux_stats_total_s": float(aux_stats_total_s),
+                        "residual_stats_total_s": float(residual_stats_total_s),
+                        "backward_s": float(backward_s),
+                        "opt_step_s": float(opt_step_s),
+                        "density_s": float(density_s),
+                        "step_total_s": float(step_total_s),
+                        "eta_stage_s": float(eta_stage_s),
+                        **memory_snapshot,
+                    })
+
+                    history["loss"].append(float(loss.detach().item()))
+                    history["photo"].append(float(photo_loss.detach().item()))
+                    history["reg"].append(float(reg_loss.detach().item()))
+                    history["num_gaussians"].append(float(self.field_model.num_gaussians))
+
+                    if verbose_progress or (
+                        train_cfg.print_every > 0 and ((step + 1) % train_cfg.print_every == 0 or step == 0)
+                    ):
+                        density_msg = ""
+                        if density_event.changed:
+                            density_msg = (
+                                f"  density(pruned={density_event.pruned},"
+                                f" split={density_event.split},"
+                                f" cloned={density_event.cloned}, N={density_event.after})"
+                            )
+                        self._progress_print(
+                            f"[stage {stage_idx + 1}/{total_stages} | scale={stage_scale:.2f} | render={render_h}x{render_w}] "
+                            f"step {step + 1:05d}/{steps:05d}  "
+                            f"loss={history['loss'][-1]:.6f}  "
+                            f"photo={history['photo'][-1]:.6f}  "
+                            f"reg={history['reg'][-1]:.6f}  "
+                            f"N={self.field_model.num_gaussians}  "
+                            f"views={view_total_s:.2f}s(field={field_total_s:.2f}s render={render_total_s:.2f}s aux={aux_stats_total_s:.2f}s residual={residual_stats_total_s:.2f}s)  "
+                            f"backward={backward_s:.2f}s  "
+                            f"opt={opt_step_s:.2f}s  "
+                            f"density={density_s:.2f}s  "
+                            f"total={step_total_s:.2f}s  "
+                            f"eta={self._format_eta(eta_stage_s)}  "
+                            f"cuda_alloc={memory_snapshot['cuda_alloc_gib']:.2f}GiB  "
+                            f"cuda_max={memory_snapshot['cuda_max_alloc_gib']:.2f}GiB"
+                            f"{density_msg}"
+                        )
+                    if density_event.ran:
+                        debug = density_event.debug_dict()
+                        split_top = ",".join(str(x["index"]) for x in debug.get("split_top", []))
+                        clone_top = ",".join(str(x["index"]) for x in debug.get("clone_top", []))
+                        self._progress_print(
+                            f"[density step={global_step}] "
+                            f"vis_mean={debug.get('visibility_mean', 0.0):.6f} "
+                            f"vis_max={debug.get('visibility_max', 0.0):.6f} "
+                            f"res_mean={debug.get('residual_mean', 0.0):.6f} "
+                            f"res_max={debug.get('residual_max', 0.0):.6f} "
+                            f"peak_mean={debug.get('peak_error_mean', 0.0):.6f} "
+                            f"peak_max={debug.get('peak_error_max', 0.0):.6f} "
+                            f"trans_mean={debug.get('transmittance_mean', 0.0):.6f} "
+                            f"split_top=[{split_top}] "
+                            f"clone_top=[{clone_top}]"
+                        )
+                    if step_callback is not None:
+                        step_callback(stage_idx, step, global_step)
+                    global_step += 1
+
+            _emit_progress({
+                "event": "stage_end",
+                "stage_index": int(stage_idx),
+                "stage_scale": float(stage_scale),
+                "steps": int(steps),
+                "stage_elapsed_s": float(time.perf_counter() - stage_start_time),
+                "num_gaussians": int(self.field_model.num_gaussians),
+            })
+
+        return history
+
+
+def fit_posefree_gaussian_scene(
+    images: Tensor,
+    intrinsics: Tensor | None = None,
+    config: PoseFreeGaussianConfig | None = None,
+    density_event_log_path: str | Path | None = None,
+    density_event_callback: Callable[[dict], None] | None = None,
+    verbose_progress: bool = False,
+    progress_log_path: str | Path | None = None,
+    progress_event_callback: Callable[[dict], None] | None = None,
+    synchronize_progress_timing: bool = False,
+    step_callback: Callable[[int, int, int], None] | None = None,
+) -> tuple[PoseFreeGaussianSR, dict[str, list]]:
+    pipeline = PoseFreeGaussianSR.from_images(images, intrinsics=intrinsics, config=config)
+    history = pipeline.fit(
+        images,
+        density_event_log_path=density_event_log_path,
+        density_event_callback=density_event_callback,
+        verbose_progress=verbose_progress,
+        progress_log_path=progress_log_path,
+        progress_event_callback=progress_event_callback,
+        synchronize_progress_timing=synchronize_progress_timing,
+        step_callback=step_callback,
+    )
+    return pipeline, history
+
+
+def render_arbitrary_scale(
+    pipeline: PoseFreeGaussianSR,
+    view_index: int = 0,
+    scale: float = 4.0,
+) -> Tensor:
+    render = pipeline.render_view(view_index=view_index, scale=scale, return_aux=False)
+    return render["rgb"]  # type: ignore[return-value]
+
+
+__all__ = [
+    "PoseFreeGaussianSR",
+    "fit_posefree_gaussian_scene",
+    "render_arbitrary_scale",
+]

@@ -1,0 +1,8 @@
+.ruff_cache
+__pycache__
+*.blend
+render*/
+result*
+.pytest_cache
+.hypothesis
+temp-output*
