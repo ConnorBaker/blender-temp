@@ -3,9 +3,11 @@ from hypothesis import given, strategies as st
 from torch.testing import assert_close
 
 from blender_temp.gaussian_sr.density_control import (
+    _reseed_view_indices,
     apply_density_control,
     build_density_debug_summary,
     compute_prune_keep_mask,
+    DensityViewCoverage,
     NormalizedRenderStats,
     normalize_render_stats,
     select_clone_indices,
@@ -168,6 +170,39 @@ def test_build_density_debug_summary_reports_peak_bins() -> None:
     assert len(summary.split_top) == 2
     assert summary.split_top[0].peak_bin in (0, 1)
     assert summary.clone_top[0].index == 1
+
+
+def test_reseed_view_indices_triggers_before_weak_view_floor() -> None:
+    cfg = DensityControlConfig(
+        weak_view_reseed_budget_per_view=16,
+        weak_view_reseed_trigger_fraction_of_best=0.90,
+        min_view_visible_fraction_of_best=0.50,
+        min_view_intersection_fraction_of_best=0.50,
+        coverage_floor_visible_fraction=0.50,
+        coverage_floor_intersection_fraction=0.50,
+        weak_view_error_fraction_of_worst=0.0,
+    )
+    coverages = [
+        DensityViewCoverage(
+            view_index=0, visible_count=100, intersection_count=1000, render_width=10, render_height=10
+        ),
+        DensityViewCoverage(view_index=1, visible_count=89, intersection_count=910, render_width=10, render_height=10),
+        DensityViewCoverage(view_index=2, visible_count=91, intersection_count=910, render_width=10, render_height=10),
+    ]
+    visible_fraction = torch.tensor([1.0, 0.89, 0.91], dtype=torch.float32)
+    intersection_fraction = torch.tensor([1.0, 0.91, 0.91], dtype=torch.float32)
+    error_fraction = torch.tensor([0.2, 1.0, 1.0], dtype=torch.float32)
+
+    out = _reseed_view_indices(
+        coverages,
+        visible_fraction_of_best=visible_fraction,
+        intersection_fraction_of_best=intersection_fraction,
+        error_fraction_of_worst=error_fraction,
+        weak_view_indices=(),
+        cfg=cfg,
+    )
+
+    assert out == (1,)
 
 
 @DEFAULT_SETTINGS

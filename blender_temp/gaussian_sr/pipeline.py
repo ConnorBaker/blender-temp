@@ -26,6 +26,7 @@ from .progress_logging import emit_progress_event
 from .warp_gsplat_contracts import RasterConfig
 from .warp_gsplat_renderer import (
     PreparedVisibility,
+    clear_warp_launch_cache,
     render_visibility_meta_warp,
     render_stats_prepared_warp,
     render_stats_warp,
@@ -44,6 +45,12 @@ _META_STAT_KEYS = (
 )
 _DENSITY_STAT_KEYS = ("contrib", "transmittance", "hits", "residual", "error_map")
 _TORCH_COMPILE_ENABLED = True
+
+
+class NonFiniteTrainingError(FloatingPointError):
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+        super().__init__(f"Non-finite state detected: {payload}")
 
 
 def set_torch_compile_enabled(enabled: bool) -> None:
@@ -200,6 +207,7 @@ class PoseFreeGaussianSR(nn.Module):
             self._train_step_all_views_density_eager,
             "train_step_all_views_density",
         )
+        self._debug_optimizer: torch.optim.Optimizer | None = None
 
     @classmethod
     def from_images(
@@ -236,9 +244,24 @@ class PoseFreeGaussianSR(nn.Module):
             {"params": list(self.field_model.parameters_for_optimizer()), "lr": train_cfg.lr_field},
             {"params": list(self.camera_model.parameters()), "lr": train_cfg.lr_camera},
         ]
+        if self.config.camera.learn_intrinsics:
+            params.append({"params": list(self.intrinsics.parameters()), "lr": train_cfg.lr_camera})
         if self.residual_head is not None:
             params.append({"params": list(self.residual_head.parameters()), "lr": train_cfg.lr_residual})
         return torch.optim.Adam(params)
+
+    def _rebuild_optimizer_after_density(
+        self,
+        old_opt: torch.optim.Optimizer,
+        train_cfg: TrainConfig,
+        survivor_sources: Tensor | None,
+        appended_count: int,
+    ) -> torch.optim.Optimizer:
+        del old_opt, survivor_sources, appended_count
+        # Density events change the geometry distribution abruptly enough that reusing Adam moments across any
+        # parameter group can poison subsequent steps. A fresh optimizer is stable on the saved density checkpoints,
+        # so reset all groups here rather than carrying stale state through the topology change.
+        return self._make_optimizer(train_cfg)
 
     def _scale_intrinsics(self, out_h: int, out_w: int) -> Tensor:
         scale_x = out_w / self.train_width
@@ -788,21 +811,13 @@ class PoseFreeGaussianSR(nn.Module):
         return self.config.train.photometric_l1_weight * l1 + self.config.train.photometric_ssim_weight * ssim_l
 
     def _regularization(self, field: dict[str, Tensor | None] | None, stage_alpha: float) -> Tensor:
-        depth_map = None if field is None else field.get("depth_map")
         opacity = None if field is None else field.get("opacity")
         scale = None if field is None else field.get("scale")
-        if depth_map is None:
-            depth = torch.nn.functional.softplus(self.field_model.depth_raw) + self.field_model.field_cfg.min_depth
-            if int(depth.shape[0]) == int(self.field_model.gh * self.field_model.gw):
-                depth_map = depth.view(self.field_model.gh, self.field_model.gw)
         if opacity is None:
             opacity = torch.sigmoid(self.field_model.opacity_logit[:, 0])
         if scale is None:
             scale = torch.exp(self.field_model.log_scale)
-        if depth_map is None:
-            depth_tv = torch.zeros((), device=self.intrinsics.log_fx.device, dtype=self.intrinsics.log_fx.dtype)
-        else:
-            depth_tv = tv_loss_grid(depth_map)
+        depth_tv = self.field_model.seed_depth_tv()
         opacity_reg = opacity.mean()
         scale_reg = scale.mean()
         pose_reg_weight = (
@@ -891,8 +906,7 @@ class PoseFreeGaussianSR(nn.Module):
 
     def _monitored_parameter_items(self) -> list[tuple[str, Tensor]]:
         items: list[tuple[str, Tensor]] = [
-            ("depth_raw", self.field_model.depth_raw),
-            ("xyz_offset", self.field_model.xyz_offset),
+            ("means3d", self.field_model.means3d),
             ("quat_raw", self.field_model.quat_raw),
             ("log_scale", self.field_model.log_scale),
             ("opacity_logit", self.field_model.opacity_logit),
@@ -963,7 +977,7 @@ class PoseFreeGaussianSR(nn.Module):
         }
         if extra:
             payload.update(extra)
-        raise FloatingPointError(f"Non-finite state detected: {payload}")
+        raise NonFiniteTrainingError(payload)
 
     def fit(
         self,
@@ -976,6 +990,10 @@ class PoseFreeGaussianSR(nn.Module):
         progress_event_callback: Callable[[dict], None] | None = None,
         synchronize_progress_timing: bool = False,
         step_callback: Callable[[int, int, int], None] | None = None,
+        optimizer_state_dict: dict[str, object] | None = None,
+        resume_stage_index: int = 0,
+        resume_step_index: int = -1,
+        resume_global_step: int = -1,
     ) -> dict[str, list]:
         train_cfg = train_cfg or self.config.train
         if images.shape[0] != self.num_views:
@@ -983,11 +1001,27 @@ class PoseFreeGaussianSR(nn.Module):
         if images.shape[-2] != self.train_height or images.shape[-1] != self.train_width:
             raise ValueError("Training images must match initialization resolution.")
 
-        opt = self._make_optimizer(train_cfg)
-        history: dict[str, list] = {"loss": [], "photo": [], "reg": [], "num_gaussians": [], "density_events": []}
         total_stages = len(train_cfg.stage_scales)
         if len(train_cfg.steps_per_stage) != total_stages:
             raise ValueError("steps_per_stage must have the same length as stage_scales.")
+        if resume_stage_index < 0 or resume_stage_index > total_stages:
+            raise ValueError(f"resume_stage_index must be in [0, {total_stages}], got {resume_stage_index}")
+        if resume_step_index < -1:
+            raise ValueError(f"resume_step_index must be >= -1, got {resume_step_index}")
+        if resume_stage_index < total_stages and resume_step_index >= int(
+            train_cfg.steps_per_stage[resume_stage_index]
+        ):
+            raise ValueError("resume_step_index must be smaller than the number of steps in the resumed stage")
+
+        opt = self._make_optimizer(train_cfg)
+        if optimizer_state_dict is not None:
+            opt.load_state_dict(optimizer_state_dict)
+            for state in opt.state.values():
+                for key, value in list(state.items()):
+                    if isinstance(value, torch.Tensor):
+                        state[key] = value.to(device=images.device)
+        self._debug_optimizer = opt
+        history: dict[str, list] = {"loss": [], "photo": [], "reg": [], "num_gaussians": [], "density_events": []}
 
         progress_enabled = bool(
             verbose_progress or progress_log_path is not None or progress_event_callback is not None
@@ -1010,9 +1044,15 @@ class PoseFreeGaussianSR(nn.Module):
                 callback=progress_event_callback,
             )
 
-        global_step = 0
+        global_step = int(resume_global_step)
         for stage_idx, stage_scale in enumerate(train_cfg.stage_scales):
+            if stage_idx < resume_stage_index:
+                continue
             steps = train_cfg.steps_per_stage[stage_idx]
+            step_start_index = max(0, resume_step_index + 1) if stage_idx == resume_stage_index else 0
+            if step_start_index >= int(steps):
+                continue
+            clear_warp_launch_cache()
             stage_h = max(1, int(round(self.train_height * float(stage_scale))))
             stage_w = max(1, int(round(self.train_width * float(stage_scale))))
             render_h, render_w = observation_render_size(stage_h, stage_w, self.config.observation)
@@ -1029,6 +1069,8 @@ class PoseFreeGaussianSR(nn.Module):
                 "stage_index": int(stage_idx),
                 "stage_scale": float(stage_scale),
                 "steps": int(steps),
+                "resume_step_index": int(resume_step_index) if stage_idx == resume_stage_index else -1,
+                "resume_global_step": int(global_step) if stage_idx == resume_stage_index else -1,
                 "stage_height": int(stage_h),
                 "stage_width": int(stage_w),
                 "render_height": int(render_h),
@@ -1040,9 +1082,14 @@ class PoseFreeGaussianSR(nn.Module):
                     f"[stage-start] stage={stage_idx + 1}/{total_stages} scale={stage_scale:.2f} "
                     f"stage={stage_h}x{stage_w} render={render_h}x{render_w} "
                     f"N={self.field_model.num_gaussians}"
+                    + (
+                        f" resume_step={step_start_index + 1}"
+                        if stage_idx == resume_stage_index and step_start_index > 0
+                        else ""
+                    )
                 )
 
-            for step in range(steps):
+            for step in range(step_start_index, steps):
                 with torch.profiler.record_function("pipeline.step"):
                     step_start_time = time.perf_counter()
                     if not timing_enabled:
@@ -1061,7 +1108,10 @@ class PoseFreeGaussianSR(nn.Module):
                         view_ids = list(range(self.num_views))
                     full_view_batch = len(view_ids) == self.num_views
                     use_compiled_train_step = bool(
-                        not debug_progress_enabled and not timing_enabled and full_view_batch
+                        not debug_progress_enabled
+                        and not timing_enabled
+                        and full_view_batch
+                        and stage_idx != (total_stages - 1)
                     )
 
                     _emit_progress({
@@ -1141,10 +1191,18 @@ class PoseFreeGaussianSR(nn.Module):
                                 render_profile: dict[str, float] = {}
                                 residual_stats_s = 0.0
                                 tgt = stage_targets[v]
-                                if timing_enabled or debug_progress_enabled:
+                                view_R = R_all[v].detach() if stage_idx == (total_stages - 1) else R_all[v]
+                                view_t = t_all[v].detach() if stage_idx == (total_stages - 1) else t_all[v]
+                                view_intr = intr.detach() if stage_idx == (total_stages - 1) else intr
+                                view_base_intr = base_intr.detach() if stage_idx == (total_stages - 1) else base_intr
+                                if (
+                                    timing_enabled
+                                    or debug_progress_enabled
+                                    or (density_due and self.config.density.weak_view_reseed_budget_per_view > 0)
+                                ):
                                     render = self.render_with_pose(
-                                        R_all[v],
-                                        t_all[v],
+                                        view_R,
+                                        view_t,
                                         render_h,
                                         render_w,
                                         return_aux=True,
@@ -1176,7 +1234,12 @@ class PoseFreeGaussianSR(nn.Module):
                                                 "view_ordinal": int(view_pos),
                                             },
                                         )
-                                    photo_loss = photo_loss + photo_term
+                                    if stage_idx == (total_stages - 1):
+                                        photo_loss = photo_loss + photo_term.detach()
+                                        with torch.profiler.record_function("pipeline.photo_backward"):
+                                            (photo_term / max(len(view_ids), 1)).backward()
+                                    else:
+                                        photo_loss = photo_loss + photo_term
                                     render_profile = (
                                         render.get("profile", {}) if isinstance(render.get("profile"), dict) else {}
                                     )
@@ -1202,6 +1265,16 @@ class PoseFreeGaussianSR(nn.Module):
                                         stats_accum = self._accumulate_render_stats(stats_accum, render["render_stats"])
                                     render_summary = self._render_stats_summary(render["render_stats"])
                                     if density_due:
+                                        target_render = (
+                                            tgt
+                                            if tuple(tgt.shape[-2:]) == (render_h, render_w)
+                                            else torch.nn.functional.interpolate(
+                                                tgt.unsqueeze(0),
+                                                size=(render_h, render_w),
+                                                mode="bilinear",
+                                                align_corners=False,
+                                            ).squeeze(0)
+                                        )
                                         per_view_observations.append(
                                             DensityViewObservation(
                                                 coverage=DensityViewCoverage(
@@ -1212,16 +1285,22 @@ class PoseFreeGaussianSR(nn.Module):
                                                     render_height=int(render_summary["render_height"]),
                                                 ),
                                                 render_stats=residual_stats,
+                                                residual_map=residual_map.detach(),
+                                                target_rgb=target_render.detach(),
+                                                pred_rgb=pred.detach(),
+                                                R_cw=view_R.detach(),
+                                                t_cw=view_t.detach(),
+                                                intrinsics=view_intr.detach(),
                                             )
                                         )
                                 else:
                                     with torch.profiler.record_function("pipeline.training_view_forward"):
                                         if density_due:
                                             train_view = self._training_view_forward_density(
-                                                base_intr,
-                                                intr,
-                                                R_all[v],
-                                                t_all[v],
+                                                view_base_intr,
+                                                view_intr,
+                                                view_R,
+                                                view_t,
                                                 tgt,
                                                 render_h,
                                                 render_w,
@@ -1231,10 +1310,10 @@ class PoseFreeGaussianSR(nn.Module):
                                             stats_accum = self._accumulate_render_stats(stats_accum, residual_stats)
                                         else:
                                             train_view = self._training_view_forward(
-                                                base_intr,
-                                                intr,
-                                                R_all[v],
-                                                t_all[v],
+                                                view_base_intr,
+                                                view_intr,
+                                                view_R,
+                                                view_t,
                                                 tgt,
                                                 render_h,
                                                 render_w,
@@ -1269,7 +1348,12 @@ class PoseFreeGaussianSR(nn.Module):
                                                 "view_ordinal": int(view_pos),
                                             },
                                         )
-                                    photo_loss = photo_loss + photo_term
+                                    if stage_idx == (total_stages - 1):
+                                        photo_loss = photo_loss + photo_term.detach()
+                                        with torch.profiler.record_function("pipeline.photo_backward"):
+                                            (photo_term / max(len(view_ids), 1)).backward()
+                                    else:
+                                        photo_loss = photo_loss + photo_term
                                     render_summary = self._render_stats_summary(
                                         self._meta_dict(train_view[3:meta_offset])
                                     )
@@ -1284,6 +1368,10 @@ class PoseFreeGaussianSR(nn.Module):
                                                     render_height=int(render_summary["render_height"]),
                                                 ),
                                                 render_stats=residual_stats,
+                                                target_rgb=tgt.detach(),
+                                                R_cw=view_R.detach(),
+                                                t_cw=view_t.detach(),
+                                                intrinsics=view_intr.detach(),
                                             )
                                         )
                                 rendered_any = True
@@ -1329,11 +1417,13 @@ class PoseFreeGaussianSR(nn.Module):
                         if not rendered_any:
                             raise RuntimeError("No views were rendered during training step.")
                         reg_loss = self._regularization_impl(None, stage_alpha)
-                        loss = photo_loss + reg_loss
                         if not torch.isfinite(photo_loss):
                             self._raise_nonfinite("photo_loss", stage_idx, step, global_step)
                         if not torch.isfinite(reg_loss):
                             self._raise_nonfinite("reg_loss", stage_idx, step, global_step)
+                        loss = (
+                            photo_loss + reg_loss.detach() if stage_idx == (total_stages - 1) else photo_loss + reg_loss
+                        )
                         if not torch.isfinite(loss):
                             self._raise_nonfinite("loss", stage_idx, step, global_step)
 
@@ -1342,10 +1432,16 @@ class PoseFreeGaussianSR(nn.Module):
                             self._sync_for_timing(images.device)
                             backward_start = time.perf_counter()
                         with torch.profiler.record_function("pipeline.backward"):
-                            loss.backward()
+                            if stage_idx == (total_stages - 1):
+                                reg_loss.backward()
+                            else:
+                                loss.backward()
                         if timing_enabled:
                             self._sync_for_timing(images.device)
                             backward_s = time.perf_counter() - backward_start
+                        if stage_idx == (total_stages - 1):
+                            for param in self.camera_model.parameters():
+                                param.grad = None
                         if train_cfg.grad_clip > 0:
                             torch.nn.utils.clip_grad_norm_(self.parameters(), train_cfg.grad_clip)
                         opt_step_start = time.perf_counter()
@@ -1357,6 +1453,12 @@ class PoseFreeGaussianSR(nn.Module):
                         if timing_enabled:
                             self._sync_for_timing(images.device)
                             opt_step_s = time.perf_counter() - opt_step_start
+
+                    self.field_model.enforce_protection(
+                        global_step,
+                        float(self.config.density.weak_view_reseed_min_opacity),
+                    )
+                    self.field_model.enforce_scale_floor()
 
                     if not torch.isfinite(photo_loss):
                         self._raise_nonfinite("photo_loss", stage_idx, step, global_step)
@@ -1408,23 +1510,44 @@ class PoseFreeGaussianSR(nn.Module):
                                 self.field_model,
                                 self.config.density,
                                 global_step,
+                                stage_index=stage_idx,
+                                total_stages=total_stages,
                                 render_stats=stats_accum,
                                 per_view_observations=per_view_observations,
                             )
                         density_s = time.perf_counter() - density_start
                     if density_event.changed:
-                        opt = self._make_optimizer(train_cfg)
+                        clear_warp_launch_cache()
+                        self.field_model.enforce_scale_floor()
+                        opt = self._rebuild_optimizer_after_density(
+                            opt,
+                            train_cfg,
+                            density_event.survivor_sources,
+                            int(density_event.appended_count),
+                        )
+                        self._debug_optimizer = opt
                     if density_event.ran:
+                        density_summary = density_event.debug_dict()
                         event_record = {
                             "global_step": int(global_step),
                             "stage_index": int(stage_idx),
                             "step_index": int(step),
-                            "summary": density_event.debug_dict(),
+                            "summary": density_summary,
                             "pruned": int(density_event.pruned),
                             "split": int(density_event.split),
                             "cloned": int(density_event.cloned),
+                            "reseeded": int(density_event.reseeded),
                             "before": int(density_event.before),
                             "after": int(density_event.after),
+                            "prune_protected": bool(density_summary.get("prune_protected", False)),
+                            "coverage_weights": list(density_summary.get("coverage_weights", [])),
+                            "visible_fraction_of_best": list(density_summary.get("visible_fraction_of_best", [])),
+                            "intersection_fraction_of_best": list(
+                                density_summary.get("intersection_fraction_of_best", [])
+                            ),
+                            "weak_view_indices": list(density_summary.get("weak_view_indices", [])),
+                            "reseed_view_indices": list(density_summary.get("reseed_view_indices", [])),
+                            "view_coverages": list(density_summary.get("view_coverages", [])),
                         }
                         history["density_events"].append(event_record)
                         emit_density_event(
@@ -1435,7 +1558,8 @@ class PoseFreeGaussianSR(nn.Module):
 
                     step_total_s = time.perf_counter() - step_start_time
                     stage_elapsed_s = time.perf_counter() - stage_start_time
-                    eta_stage_s = (stage_elapsed_s / float(step + 1)) * float(steps - step - 1)
+                    completed_stage_steps = max(1, int(step - step_start_index + 1))
+                    eta_stage_s = (stage_elapsed_s / float(completed_stage_steps)) * float(steps - step - 1)
                     memory_snapshot = self._memory_snapshot(images.device)
                     _emit_progress({
                         "event": "step_end",

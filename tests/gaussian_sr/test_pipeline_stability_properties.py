@@ -434,3 +434,51 @@ def test_regularization_without_render_field_stays_finite_after_density_growth()
 
     assert reg.ndim == 0
     assert torch.isfinite(reg)
+
+
+def test_rebuild_optimizer_after_density_resets_all_optimizer_state() -> None:
+    images = torch.zeros((2, 3, 4, 4), dtype=torch.float32)
+
+    cfg = PoseFreeGaussianConfig()
+    cfg.camera.learn_intrinsics = False
+    cfg.appearance.mode = "constant"
+    cfg.field.use_residual_head = False
+    cfg.field.anchor_stride = 2
+    cfg.field.feature_dim = 2
+    cfg.train.print_every = 0
+    cfg.density.enabled = False
+
+    pipeline = PoseFreeGaussianSR.from_images(images, intrinsics=None, config=cfg)
+    opt = pipeline._make_optimizer(cfg.train)
+
+    for param in opt.param_groups[0]["params"]:
+        opt.state[param] = {
+            "step": torch.tensor(7.0),
+            "exp_avg": torch.full_like(param, 3.0),
+            "exp_avg_sq": torch.full_like(param, 5.0),
+        }
+
+    camera_param = opt.param_groups[1]["params"][0]
+    camera_state = {
+        "step": torch.tensor(11.0),
+        "exp_avg": torch.full_like(camera_param, 2.0),
+        "exp_avg_sq": torch.full_like(camera_param, 4.0),
+    }
+    opt.state[camera_param] = {
+        "step": camera_state["step"].clone(),
+        "exp_avg": camera_state["exp_avg"].clone(),
+        "exp_avg_sq": camera_state["exp_avg_sq"].clone(),
+    }
+
+    before = pipeline.field_model.num_gaussians
+    pipeline.field_model.clone_gaussians(torch.tensor([0], dtype=torch.long))
+    rebuilt = pipeline._rebuild_optimizer_after_density(
+        opt,
+        cfg.train,
+        survivor_sources=torch.arange(before, dtype=torch.long),
+        appended_count=1,
+    )
+
+    for group in rebuilt.param_groups:
+        for param in group["params"]:
+            assert not rebuilt.state.get(param, {})

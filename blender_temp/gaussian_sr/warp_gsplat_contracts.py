@@ -38,6 +38,7 @@ class RasterConfig:
     sort_mode: Literal["auto", "warp_radix", "torch_sort"] = "auto"
     background_rgb: tuple[float, float, float] = (0.0, 0.0, 0.0)
     record_projection_and_rasterize_on_tape: bool = True
+    backward_impl: Literal["warp_tape", "reference", "hybrid"] = "hybrid"
     max_pixels_per_launch: int | None = None
 
 

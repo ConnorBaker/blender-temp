@@ -1,5 +1,6 @@
 import json
 import logging
+import random
 import sys
 import time
 from argparse import ArgumentParser, Namespace
@@ -13,7 +14,8 @@ from torchvision.io import decode_image
 from torchvision.transforms import v2
 from torchvision.utils import save_image
 
-from blender_temp.gaussian_sr.debug_checkpoint import restore_module_from_debug_checkpoint
+from blender_temp.gaussian_sr.debug_checkpoint import load_debug_checkpoint, restore_module_from_debug_checkpoint
+from blender_temp.gaussian_sr.pipeline import NonFiniteTrainingError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s", stream=sys.stderr)
 LOGGER = logging.getLogger(__name__)
@@ -146,6 +148,8 @@ class _DebugRunObserver:
     progress_log_path: Path
     preview_every: int
     diagnostic_meta_every: int
+    stage2_checkpoint_every: int
+    stage2_checkpoint_start_global_step: int
     collapse_action: Literal["off", "warn", "abort"]
     collapse_density_threshold: float
     collapse_view_threshold: int
@@ -170,6 +174,17 @@ class _DebugRunObserver:
         payload = {"timestamp_utc": self._timestamp_utc(), **event}
         with self.progress_log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, sort_keys=True) + "\n")
+
+    def _cpu_clone(self, value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().clone()
+        if isinstance(value, dict):
+            return {key: self._cpu_clone(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._cpu_clone(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._cpu_clone(item) for item in value)
+        return value
 
     def _meta_summary(self, meta: dict[str, torch.Tensor]) -> dict[str, int]:
         summary: dict[str, int] = {}
@@ -215,6 +230,16 @@ class _DebugRunObserver:
             "num_gaussians": int(self.pipeline.field_model.num_gaussians),
             "config": asdict(self.cfg),
             "pipeline_state_dict": state_dict,
+        }
+        optimizer = getattr(self.pipeline, "_debug_optimizer", None)
+        if optimizer is not None:
+            payload["optimizer_state_dict"] = self._cpu_clone(optimizer.state_dict())
+        payload["rng_state"] = {
+            "torch": torch.get_rng_state().cpu().clone(),
+            "cuda": [state.cpu().clone() for state in torch.cuda.get_rng_state_all()]
+            if torch.cuda.is_available()
+            else [],
+            "python_random": random.getstate(),
         }
         if extra:
             payload["extra"] = extra
@@ -424,11 +449,7 @@ class _DebugRunObserver:
                 })
                 raise RuntimeError(
                     f"{message} Restored last safe checkpoint {rollback_path}."
-                    + (
-                        ""
-                        if rollback_preview_path is None
-                        else f" Rollback previews: {rollback_preview_path}."
-                    )
+                    + ("" if rollback_preview_path is None else f" Rollback previews: {rollback_preview_path}.")
                 )
             raise RuntimeError(message)
 
@@ -496,6 +517,17 @@ class _DebugRunObserver:
             return
         render_h = int(event.get("render_height", 0))
         render_w = int(event.get("render_width", 0))
+        if self.stage2_checkpoint_every > 0 and stage_index == 1:
+            if (
+                global_step >= self.stage2_checkpoint_start_global_step
+                and (step_index + 1) % self.stage2_checkpoint_every == 0
+            ):
+                self.save_checkpoint(
+                    reason="periodic",
+                    stage_index=stage_index,
+                    step_index=step_index,
+                    global_step=global_step,
+                )
         if self.preview_every > 0 and stage_index == len(self.cfg.train.stage_scales) - 1:
             if (step_index + 1) % self.preview_every == 0:
                 self.save_previews(
@@ -536,6 +568,8 @@ class _DebugRunObserver:
         visibility_mean = float(summary.get("visibility_mean", float("nan")))
         if not (visibility_mean < self.collapse_density_threshold):
             return
+        if int(event.get("reseeded", 0)) > 0:
+            return
         render_h = int(self.pipeline.train_height)
         render_w = int(self.pipeline.train_width)
         self._signal_collapse(
@@ -564,6 +598,12 @@ def setup_argparse() -> ArgumentParser:
         type=Path,
         help="Directory to write super-resolved output",
         default=Path("output"),
+    )
+    parser.add_argument(
+        "--resume-debug-checkpoint",
+        type=Path,
+        help="Resume training from a saved debug checkpoint instead of initializing a fresh scene",
+        default=None,
     )
     parser.add_argument(
         "--scale",
@@ -622,6 +662,12 @@ def setup_argparse() -> ArgumentParser:
         help="Disable torch.compile and run the training loop eagerly",
     )
     parser.add_argument(
+        "--renderer-backward-impl",
+        choices=("hybrid", "reference", "warp_tape"),
+        help="Override the renderer backward implementation",
+        default=None,
+    )
+    parser.add_argument(
         "--debug-preview-every",
         type=int,
         help="During the final stage, save preview renders for all views every N steps; defaults to 50 in verbose mode",
@@ -632,6 +678,18 @@ def setup_argparse() -> ArgumentParser:
         type=int,
         help="When torch.compile is enabled, run a meta-only visibility diagnostic every N final-stage steps; defaults to 50",
         default=None,
+    )
+    parser.add_argument(
+        "--debug-stage2-checkpoint-every",
+        type=int,
+        help="During stage 2, save a rolling debug checkpoint every N steps; 0 disables this",
+        default=0,
+    )
+    parser.add_argument(
+        "--debug-stage2-checkpoint-start-global-step",
+        type=int,
+        help="Only start the periodic stage-2 checkpoint cadence at or after this global step",
+        default=0,
     )
     parser.add_argument(
         "--collapse-action",
@@ -656,6 +714,11 @@ def setup_argparse() -> ArgumentParser:
         type=int,
         help="Number of consecutive low-visibility samples before triggering the collapse action",
         default=3,
+    )
+    parser.add_argument(
+        "--disable-runtime-observer",
+        action="store_true",
+        help="Disable debug observer callbacks and run logs to match the minimal stable training path",
     )
     parser.add_argument(
         "--allow-unsafe-config",
@@ -692,6 +755,24 @@ def load_images(image_paths: list[Path], device: torch.device) -> torch.Tensor:
 
     batch = torch.stack(tensors).to(device)
     return batch
+
+
+def _restore_rng_state(payload: dict[str, object]) -> bool:
+    rng_state = payload.get("rng_state")
+    if not isinstance(rng_state, dict):
+        return False
+    torch_state = rng_state.get("torch")
+    if isinstance(torch_state, torch.Tensor):
+        torch.set_rng_state(torch_state.cpu())
+    cuda_state = rng_state.get("cuda")
+    if isinstance(cuda_state, list) and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([
+            state.cpu() if isinstance(state, torch.Tensor) else state for state in cuda_state
+        ])
+    python_random = rng_state.get("python_random")
+    if python_random is not None:
+        random.setstate(python_random)
+    return True
 
 
 def assess_run_safety(
@@ -868,6 +949,9 @@ def main() -> None:
 
     input_dir: Path = args.input_dir.resolve()
     output_dir: Path = args.output_dir.resolve()
+    resume_debug_checkpoint: Path | None = (
+        args.resume_debug_checkpoint.resolve() if args.resume_debug_checkpoint is not None else None
+    )
     scale: float = float(args.scale)
     device = torch.device(args.device)
     max_frames: int | None = args.max_frames
@@ -878,16 +962,23 @@ def main() -> None:
     verbose_progress: bool = bool(args.verbose_progress)
     profile_pytorch: bool = bool(args.profile_pytorch)
     disable_torch_compile: bool = bool(args.disable_torch_compile)
+    renderer_backward_impl: str | None = args.renderer_backward_impl
     debug_preview_every_arg: int | None = args.debug_preview_every
     diagnostic_meta_every_arg: int | None = args.diagnostic_meta_every
+    debug_stage2_checkpoint_every: int = int(args.debug_stage2_checkpoint_every)
+    debug_stage2_checkpoint_start_global_step: int = int(args.debug_stage2_checkpoint_start_global_step)
     collapse_action: Literal["off", "warn", "abort"] = args.collapse_action
     collapse_density_threshold: float = float(args.collapse_density_threshold)
     collapse_view_threshold: int = int(args.collapse_view_threshold)
     collapse_view_persistence: int = int(args.collapse_view_persistence)
+    disable_runtime_observer: bool = bool(args.disable_runtime_observer)
     allow_unsafe_config: bool = bool(args.allow_unsafe_config)
 
     if not input_dir.is_dir():
         LOGGER.error("Input directory not found: %s", input_dir)
+        raise SystemExit(1)
+    if resume_debug_checkpoint is not None and not resume_debug_checkpoint.is_file():
+        LOGGER.error("Resume checkpoint not found: %s", resume_debug_checkpoint)
         raise SystemExit(1)
     if max_frames is not None and max_frames <= 0:
         LOGGER.error("--max-frames must be a positive integer")
@@ -909,6 +1000,12 @@ def main() -> None:
         raise SystemExit(1)
     if diagnostic_meta_every_arg is not None and diagnostic_meta_every_arg < 0:
         LOGGER.error("--diagnostic-meta-every must be non-negative")
+        raise SystemExit(1)
+    if debug_stage2_checkpoint_every < 0:
+        LOGGER.error("--debug-stage2-checkpoint-every must be non-negative")
+        raise SystemExit(1)
+    if debug_stage2_checkpoint_start_global_step < 0:
+        LOGGER.error("--debug-stage2-checkpoint-start-global-step must be non-negative")
         raise SystemExit(1)
     if collapse_density_threshold < 0.0:
         LOGGER.error("--collapse-density-threshold must be non-negative")
@@ -936,13 +1033,36 @@ def main() -> None:
         image_paths = image_paths[:max_frames]
         LOGGER.info("Limiting input frames to %d of %d", len(image_paths), original_count)
 
+    resume_payload: dict[str, object] | None = None
+    if resume_debug_checkpoint is not None:
+        resume_payload = load_debug_checkpoint(resume_debug_checkpoint)
+        LOGGER.info("Resuming from debug checkpoint: %s", resume_debug_checkpoint)
+
+    safety_anchor_stride = anchor_stride
+    safety_view_batch_size = view_batch_size
+    safety_radius_clip_px = radius_clip_px
+    safety_disable_density_control_final_stage = disable_density_control_final_stage
+    if resume_payload is not None:
+        config_payload = resume_payload.get("config")
+        if not isinstance(config_payload, dict):
+            LOGGER.error("Resume checkpoint is missing an embedded config: %s", resume_debug_checkpoint)
+            raise SystemExit(1)
+        try:
+            safety_anchor_stride = int(config_payload["field"]["anchor_stride"])
+            safety_view_batch_size = int(config_payload["train"]["view_batch_size"])
+            safety_radius_clip_px = float(config_payload["render"]["radius_clip_px"])
+            safety_disable_density_control_final_stage = bool(config_payload["density"]["disable_final_stage"])
+        except (KeyError, TypeError, ValueError) as exc:
+            LOGGER.error("Resume checkpoint has an invalid embedded config: %s", exc)
+            raise SystemExit(1)
+
     safety_issues = assess_run_safety(
         num_views=len(image_paths),
         scale=scale,
-        anchor_stride=anchor_stride,
-        view_batch_size=view_batch_size,
-        radius_clip_px=radius_clip_px,
-        disable_density_control_final_stage=disable_density_control_final_stage,
+        anchor_stride=safety_anchor_stride,
+        view_batch_size=safety_view_batch_size,
+        radius_clip_px=safety_radius_clip_px,
+        disable_density_control_final_stage=safety_disable_density_control_final_stage,
     )
     for issue in safety_issues:
         if issue.severity == "warning":
@@ -966,6 +1086,7 @@ def main() -> None:
     LOGGER.info("View batch size: %s", "all" if view_batch_size == 0 else view_batch_size)
     LOGGER.info("Radius clip px: %s", radius_clip_px if radius_clip_px > 0.0 else "disabled")
     LOGGER.info("Torch compile: %s", "disabled" if disable_torch_compile else "enabled")
+    LOGGER.info("Renderer backward: %s", renderer_backward_impl or "config default")
     LOGGER.info(
         "Density control final stage: %s",
         "disabled" if disable_density_control_final_stage else "enabled",
@@ -982,10 +1103,21 @@ def main() -> None:
         if disable_torch_compile or verbose_progress
         else (50 if diagnostic_meta_every_arg is None else int(diagnostic_meta_every_arg))
     )
-    LOGGER.info("Debug preview cadence: %s", "disabled" if debug_preview_every <= 0 else f"every {debug_preview_every} final-stage steps")
+    LOGGER.info(
+        "Debug preview cadence: %s",
+        "disabled" if debug_preview_every <= 0 else f"every {debug_preview_every} final-stage steps",
+    )
     LOGGER.info(
         "Diagnostic visibility cadence: %s",
         "disabled" if diagnostic_meta_every <= 0 else f"every {diagnostic_meta_every} final-stage steps",
+    )
+    LOGGER.info(
+        "Stage-2 debug checkpoint cadence: %s",
+        (
+            "disabled"
+            if debug_stage2_checkpoint_every <= 0
+            else f"every {debug_stage2_checkpoint_every} stage-2 steps from global step {debug_stage2_checkpoint_start_global_step}"
+        ),
     )
     LOGGER.info(
         "Collapse detector: action=%s density_threshold=%.3f view_threshold=%d persistence=%d",
@@ -1000,21 +1132,45 @@ def main() -> None:
     batch = load_images(image_paths, device)
     LOGGER.info("Loaded batch: shape=%s, dtype=%s", batch.shape, batch.dtype)
 
-    from blender_temp.gaussian_sr import PoseFreeGaussianConfig, PoseFreeGaussianSR
+    from blender_temp.gaussian_sr import (
+        AppearanceConfig,
+        CameraInit,
+        DensityControlConfig,
+        FieldConfig,
+        ObservationConfig,
+        PoseFreeGaussianConfig,
+        PoseFreeGaussianSR,
+        RenderConfig,
+        TrainConfig,
+    )
     from blender_temp.gaussian_sr.pipeline import set_torch_compile_enabled
 
     images = batch
     set_torch_compile_enabled(not disable_torch_compile)
 
-    cfg = PoseFreeGaussianConfig()
-    cfg.camera.learn_intrinsics = False
-    cfg.train.stage_scales = (0.25, 0.5, 1.0)
-    cfg.train.steps_per_stage = (250, 500, 1000)
-    cfg.field.anchor_stride = anchor_stride
-    cfg.field.feature_dim = 8
-    cfg.train.view_batch_size = view_batch_size
-    cfg.render.radius_clip_px = radius_clip_px
-    cfg.density.disable_final_stage = disable_density_control_final_stage
+    if resume_payload is None:
+        cfg = PoseFreeGaussianConfig()
+        cfg.camera.learn_intrinsics = False
+        cfg.train.stage_scales = (0.25, 0.5, 1.0)
+        cfg.train.steps_per_stage = (250, 500, 1000)
+        cfg.field.anchor_stride = anchor_stride
+        cfg.field.feature_dim = 8
+        cfg.train.view_batch_size = view_batch_size
+        cfg.render.radius_clip_px = radius_clip_px
+        cfg.density.disable_final_stage = disable_density_control_final_stage
+    else:
+        config_payload = resume_payload["config"]
+        assert isinstance(config_payload, dict)
+        cfg = PoseFreeGaussianConfig(
+            camera=CameraInit(**config_payload["camera"]),
+            render=RenderConfig(**config_payload["render"]),
+            observation=ObservationConfig(**config_payload["observation"]),
+            appearance=AppearanceConfig(**config_payload["appearance"]),
+            density=DensityControlConfig(**config_payload["density"]),
+            field=FieldConfig(**config_payload["field"]),
+            train=TrainConfig(**config_payload["train"]),
+        )
+        LOGGER.info("Using the training config embedded in the resume checkpoint.")
 
     intrinsics = None
     anchor_h = (images.shape[-2] + cfg.field.anchor_stride - 1) // cfg.field.anchor_stride
@@ -1040,40 +1196,122 @@ def main() -> None:
 
     LOGGER.info("Initializing pose-free Gaussian scene...")
     pipeline = PoseFreeGaussianSR.from_images(images, intrinsics=intrinsics, config=cfg).to(device)
+    if resume_debug_checkpoint is not None:
+        _payload, skipped = restore_module_from_debug_checkpoint(pipeline, resume_debug_checkpoint)
+        if skipped:
+            LOGGER.info("Skipped %d checkpoint entries during resume restore", len(skipped))
+        restored_rng_state = _restore_rng_state(resume_payload or {})
+        LOGGER.info("Restored RNG state from checkpoint: %s", "yes" if restored_rng_state else "no")
+    if renderer_backward_impl is not None:
+        original_renderer_config = pipeline._renderer_config
+
+        def _patched_renderer_config():
+            render_cfg = original_renderer_config()
+            render_cfg.backward_impl = renderer_backward_impl
+            return render_cfg
+
+        pipeline._renderer_config = _patched_renderer_config
     LOGGER.info("Training scene model...")
-    progress_log_path, density_event_log_path = reset_run_logs(output_dir)
-    LOGGER.info("Progress log: %s", progress_log_path)
-    debug_observer = _DebugRunObserver(
-        pipeline=pipeline,
-        cfg=cfg,
-        output_dir=output_dir,
-        progress_log_path=progress_log_path,
-        preview_every=debug_preview_every,
-        diagnostic_meta_every=diagnostic_meta_every,
-        collapse_action=collapse_action,
-        collapse_density_threshold=collapse_density_threshold,
-        collapse_view_threshold=collapse_view_threshold,
-        collapse_view_persistence=collapse_view_persistence,
+    observer_requested = (
+        debug_preview_every > 0
+        or diagnostic_meta_every > 0
+        or debug_stage2_checkpoint_every > 0
+        or collapse_action != "off"
     )
-    LOGGER.info("Debug checkpoints dir: %s", debug_observer.checkpoint_dir)
-    if debug_preview_every > 0 or diagnostic_meta_every > 0:
-        LOGGER.info("Debug render dir: %s", debug_observer.preview_dir)
+    progress_log_path: Path | None = None
+    density_event_log_path: Path | None = None
+    debug_observer: _DebugRunObserver | None = None
+    if disable_runtime_observer:
+        if observer_requested:
+            LOGGER.warning(
+                "Runtime observer disabled; ignoring collapse detection, debug previews, diagnostic visibility, and periodic debug checkpoints."
+            )
+        LOGGER.info("Runtime observer: disabled")
+    else:
+        progress_log_path, density_event_log_path = reset_run_logs(output_dir)
+        LOGGER.info("Progress log: %s", progress_log_path)
+        debug_observer = _DebugRunObserver(
+            pipeline=pipeline,
+            cfg=cfg,
+            output_dir=output_dir,
+            progress_log_path=progress_log_path,
+            preview_every=debug_preview_every,
+            diagnostic_meta_every=diagnostic_meta_every,
+            stage2_checkpoint_every=debug_stage2_checkpoint_every,
+            stage2_checkpoint_start_global_step=debug_stage2_checkpoint_start_global_step,
+            collapse_action=collapse_action,
+            collapse_density_threshold=collapse_density_threshold,
+            collapse_view_threshold=collapse_view_threshold,
+            collapse_view_persistence=collapse_view_persistence,
+        )
+        LOGGER.info("Debug checkpoints dir: %s", debug_observer.checkpoint_dir)
+        if debug_preview_every > 0 or diagnostic_meta_every > 0:
+            LOGGER.info("Debug render dir: %s", debug_observer.preview_dir)
+
+    resume_stage_index = 0
+    resume_step_index = -1
+    resume_global_step = -1
+    resume_optimizer_state_dict: dict[str, object] | None = None
+    if resume_payload is not None:
+        resume_stage_index = int(resume_payload.get("stage_index", -1))
+        resume_step_index = int(resume_payload.get("step_index", -1))
+        resume_global_step = int(resume_payload.get("global_step", -1))
+        if resume_stage_index < 0:
+            LOGGER.error("Resume checkpoint has an invalid stage_index: %s", resume_stage_index)
+            raise SystemExit(1)
+        if resume_global_step < 0 and resume_stage_index > 0:
+            resume_global_step = int(sum(int(s) for s in cfg.train.steps_per_stage[:resume_stage_index])) - 1
+        optimizer_state_dict = resume_payload.get("optimizer_state_dict")
+        if isinstance(optimizer_state_dict, dict):
+            resume_optimizer_state_dict = optimizer_state_dict
+        LOGGER.info(
+            "Continuing from stage=%d step=%d global_step=%d",
+            resume_stage_index,
+            resume_step_index,
+            resume_global_step,
+        )
+
     fit_kwargs: dict[str, object] = {
-        "density_event_log_path": density_event_log_path,
-        "density_event_callback": debug_observer.on_density_event,
         "verbose_progress": verbose_progress,
-        "progress_log_path": progress_log_path,
-        "progress_event_callback": debug_observer.on_progress,
         "synchronize_progress_timing": verbose_progress,
+        "optimizer_state_dict": resume_optimizer_state_dict,
+        "resume_stage_index": resume_stage_index,
+        "resume_step_index": resume_step_index,
+        "resume_global_step": resume_global_step,
     }
-    history = fit_with_optional_pytorch_profiler(
-        pipeline,
-        images,
-        output_dir=output_dir,
-        profile_pytorch=profile_pytorch,
-        total_steps=sum(cfg.train.steps_per_stage),
-        fit_kwargs=fit_kwargs,
-    )
+    if density_event_log_path is not None:
+        fit_kwargs["density_event_log_path"] = density_event_log_path
+    if progress_log_path is not None:
+        fit_kwargs["progress_log_path"] = progress_log_path
+    if debug_observer is not None:
+        fit_kwargs["density_event_callback"] = debug_observer.on_density_event
+        fit_kwargs["progress_event_callback"] = debug_observer.on_progress
+    if resume_stage_index >= len(cfg.train.steps_per_stage):
+        remaining_total_steps = 0
+    else:
+        remaining_in_stage = max(0, int(cfg.train.steps_per_stage[resume_stage_index]) - max(0, resume_step_index + 1))
+        remaining_later = sum(int(s) for s in cfg.train.steps_per_stage[resume_stage_index + 1 :])
+        remaining_total_steps = remaining_in_stage + remaining_later
+    try:
+        history = fit_with_optional_pytorch_profiler(
+            pipeline,
+            images,
+            output_dir=output_dir,
+            profile_pytorch=profile_pytorch,
+            total_steps=remaining_total_steps,
+            fit_kwargs=fit_kwargs,
+        )
+    except NonFiniteTrainingError as exc:
+        payload = exc.payload
+        if debug_observer is not None:
+            debug_observer.save_checkpoint(
+                reason="nonfinite",
+                stage_index=int(payload.get("stage_index", -1)),
+                step_index=int(payload.get("step_index", -1)),
+                global_step=int(payload.get("global_step", -1)),
+                extra={"nonfinite": payload},
+            )
+        raise
 
     history_path = output_dir / "history.json"
     history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")

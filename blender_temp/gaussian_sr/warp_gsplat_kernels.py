@@ -431,6 +431,145 @@ def rasterize_values_kernel(
 
 
 @wp.kernel
+def rasterize_values_backward_kernel(
+    tile_start: wp.array(dtype=wp.int32),
+    tile_end: wp.array(dtype=wp.int32),
+    sorted_vals: wp.array(dtype=wp.int32),
+    xys: wp.array(dtype=wp.vec2),
+    conic: wp.array(dtype=wp.vec3),
+    rho: wp.array(dtype=wp.float32),
+    values: wp.array(dtype=wp.float32),
+    opacity: wp.array(dtype=wp.float32),
+    channels: int,
+    width: int,
+    height: int,
+    tiles_x: int,
+    tile_size: int,
+    alpha_min: float,
+    trans_eps: float,
+    clamp_alpha_max: float,
+    antialiased: int,
+    background: wp.array(dtype=wp.float32),
+    grad_out: wp.array(dtype=wp.float32),
+    grad_xys: wp.array(dtype=wp.float32),
+    grad_conic: wp.array(dtype=wp.float32),
+    grad_rho: wp.array(dtype=wp.float32),
+    grad_values: wp.array(dtype=wp.float32),
+    grad_opacity: wp.array(dtype=wp.float32),
+):
+    p = wp.tid()
+    px = p - (p // width) * width
+    py = p // width
+    tile_x = px // tile_size
+    tile_y = py // tile_size
+    tile_id = tile_y * tiles_x + tile_x
+    start = tile_start[tile_id]
+    end = tile_end[tile_id]
+    fx = float(px) + 0.5
+    fy = float(py) + 0.5
+    base = p * channels
+
+    stop = end
+    final_T = float(1.0)
+    if start < end:
+        for idx in range(start, end):
+            gid = sorted_vals[idx]
+            xy = xys[gid]
+            conic_abc = conic[gid]
+            dx = fx - xy[0]
+            dy = fy - xy[1]
+            A = conic_abc[0]
+            B = conic_abc[1]
+            C = conic_abc[2]
+            sigma = 0.5 * (A * dx * dx + C * dy * dy) + B * dx * dy
+            weight = wp.exp(-sigma)
+            alpha_base = opacity[gid] * weight
+            alpha = alpha_base
+            if antialiased != 0:
+                alpha = alpha * rho[gid]
+            if alpha > clamp_alpha_max:
+                alpha = clamp_alpha_max
+            if alpha < alpha_min:
+                continue
+            final_T *= 1.0 - alpha
+            if final_T < trans_eps:
+                stop = idx + 1
+                break
+
+    suffix_dot = float(0.0)
+    for c in range(channels):
+        suffix_dot += grad_out[base + c] * background[c]
+
+    suffix_trans = float(1.0)
+    count = stop - start
+    for rev in range(count):
+        idx = stop - 1 - rev
+        gid = sorted_vals[idx]
+        xy = xys[gid]
+        conic_abc = conic[gid]
+        dx = fx - xy[0]
+        dy = fy - xy[1]
+        A = conic_abc[0]
+        B = conic_abc[1]
+        C = conic_abc[2]
+        sigma = 0.5 * (A * dx * dx + C * dy * dy) + B * dx * dy
+        weight = wp.exp(-sigma)
+        alpha_base = opacity[gid] * weight
+        alpha_unclamped = alpha_base
+        if antialiased != 0:
+            alpha_unclamped = alpha_unclamped * rho[gid]
+        alpha = alpha_unclamped
+        clamped = 0
+        if alpha > clamp_alpha_max:
+            alpha = clamp_alpha_max
+            clamped = 1
+        if alpha < alpha_min:
+            continue
+
+        denom = (1.0 - alpha) * suffix_trans
+        if denom < 1.0e-12:
+            denom = 1.0e-12
+        T_i = final_T / denom
+        weight_i = T_i * alpha
+
+        value_base = gid * channels
+        dot_grad_value = float(0.0)
+        for c in range(channels):
+            g = grad_out[base + c]
+            v = values[value_base + c]
+            dot_grad_value += g * v
+            wp.atomic_add(grad_values, value_base + c, g * weight_i)
+
+        dL_dalpha = T_i * (dot_grad_value - suffix_dot)
+        if clamped == 0:
+            dL_dalpha_base = dL_dalpha
+            if antialiased != 0:
+                wp.atomic_add(grad_rho, gid, dL_dalpha * alpha_base)
+                dL_dalpha_base = dL_dalpha_base * rho[gid]
+
+            wp.atomic_add(grad_opacity, gid, dL_dalpha_base * weight)
+
+            dL_dsigma = -dL_dalpha_base * alpha_base
+            dL_dx = -dL_dsigma * (A * dx + B * dy)
+            dL_dy = -dL_dsigma * (C * dy + B * dx)
+            dL_dA = dL_dsigma * 0.5 * dx * dx
+            dL_dB = dL_dsigma * dx * dy
+            dL_dC = dL_dsigma * 0.5 * dy * dy
+
+            grad_xys_base = gid * 2
+            wp.atomic_add(grad_xys, grad_xys_base, dL_dx)
+            wp.atomic_add(grad_xys, grad_xys_base + 1, dL_dy)
+
+            grad_conic_base = gid * 3
+            wp.atomic_add(grad_conic, grad_conic_base, dL_dA)
+            wp.atomic_add(grad_conic, grad_conic_base + 1, dL_dB)
+            wp.atomic_add(grad_conic, grad_conic_base + 2, dL_dC)
+
+        suffix_dot = alpha * dot_grad_value + (1.0 - alpha) * suffix_dot
+        suffix_trans *= 1.0 - alpha
+
+
+@wp.kernel
 def rasterize_visibility_stats_kernel(
     tile_start: wp.array(dtype=wp.int32),
     tile_end: wp.array(dtype=wp.int32),
@@ -530,5 +669,6 @@ __all__ = [
     "init_int32_kernel",
     "get_tile_bin_edges_kernel",
     "rasterize_values_kernel",
+    "rasterize_values_backward_kernel",
     "rasterize_visibility_stats_kernel",
 ]
