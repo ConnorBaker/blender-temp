@@ -514,7 +514,7 @@ class CanonicalGaussianField(nn.Module):
         padded: bool = False,
     ) -> dict[str, Tensor | None]:
         del intrinsics
-        n = self.num_gaussians
+        n = self.active_count  # keep as tensor to avoid graph break from .item()
         if padded:
             means3d = self.means3d
             quat = normalize_quaternion(self.quat_raw)
@@ -530,7 +530,6 @@ class CanonicalGaussianField(nn.Module):
             sh_coeffs = None if self.sh_coeffs is None else self.sh_coeffs[:n]
             rgb = apply_view_dependent_rgb(self.rgb_logit[:n], sh_coeffs, means3d, R_cw, t_cw, self.appearance_cfg)
             latent = self.latent[:n]
-        depth_values = self.means3d[:n, 2]
         return {
             "means3d": means3d,
             "quat": quat,
@@ -538,9 +537,9 @@ class CanonicalGaussianField(nn.Module):
             "opacity": opacity,
             "rgb": rgb,
             "latent": latent,
-            "depth_values": depth_values,
+            "depth_values": means3d[:, 2],
             "depth_map": None,
-            "active_count": means3d.new_tensor(n, dtype=torch.long),
+            "active_count": n.clone(),
         }
 
     def forward(
