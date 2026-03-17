@@ -25,6 +25,9 @@ from .warp_gsplat_contracts import RasterConfig
 # ---------------------------------------------------------------------------
 
 
+_REDUCED_PRECISION_DTYPES = frozenset({torch.float32, torch.bfloat16})
+
+
 def _validate_helion_render_inputs(
     means: Tensor,
     quat: Tensor,
@@ -35,7 +38,7 @@ def _validate_helion_render_inputs(
     viewmat: Tensor,
     K: Tensor,
 ) -> None:
-    tensors = {
+    all_tensors = {
         "means": means,
         "quat": quat,
         "scale": scale,
@@ -45,13 +48,42 @@ def _validate_helion_render_inputs(
         "viewmat": viewmat,
         "K": K,
     }
-    for name, tensor in tensors.items():
+    for name, tensor in all_tensors.items():
         if tensor.device.type != "cuda":
             raise ValueError(f"{name} must be on CUDA for Helion backend")
-        if tensor.dtype != torch.float32:
-            raise ValueError(f"{name} must be float32 for Helion backend, got {tensor.dtype}")
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous() for Helion backend")
+
+    # Projection inputs must stay FP32: quaternion cancellation, determinant
+    # subtraction, Jacobian overflow, and sub-pixel xys precision (BF16 ULP
+    # at 1920 is ~8) all require full precision.  viewmat/K participate in
+    # the same projection math.
+    fp32_only = {"means": means, "quat": quat, "scale": scale, "viewmat": viewmat, "K": K}
+    for name, tensor in fp32_only.items():
+        if tensor.dtype != torch.float32:
+            raise ValueError(f"{name} must be float32 for Helion backend, got {tensor.dtype}")
+
+    # values and background may be FP32 or BF16.  These tensors have bounded
+    # ranges ([0,1] for RGB, moderate for latent) and are loaded into FP32
+    # arithmetic via type promotion from FP32 pixel coordinates and FP32
+    # accumulators, so BF16 storage is safe.
+    # opacity may arrive as FP32 (from field sigmoid) even when values is BF16;
+    # the forward impl downcasts it to match values before calling the kernel.
+    reduced_ok = {"values": values, "opacity": opacity, "background": background}
+    for name, tensor in reduced_ok.items():
+        if tensor.dtype not in _REDUCED_PRECISION_DTYPES:
+            raise ValueError(
+                f"{name} must be float32 or bfloat16 for Helion backend, got {tensor.dtype}"
+            )
+    # Consistency: values and background must share the same dtype so that the
+    # kernel output dtype and background blending (accum + trans * bg) are
+    # consistent.  opacity is allowed to differ since it's downcast later.
+    if values.dtype != background.dtype:
+        raise ValueError(
+            f"values and background must share the same dtype, "
+            f"got values={values.dtype}, background={background.dtype}"
+        )
+
     if means.ndim != 2 or means.shape[1] != 3:
         raise ValueError(f"means must have shape [N, 3], got {tuple(means.shape)}")
     if quat.ndim != 2 or quat.shape[1] != 4:
@@ -259,7 +291,13 @@ def _make_raster_forward_kernel(*, static_shapes: bool, runtime_autotune: bool):
         antialiased = hl.specialize(antialiased_flag)
         background_is_zero = hl.specialize(background_is_zero_flag)
         values_flat = values.view(-1)
+        # Output buffer inherits values.dtype (FP32 or BF16).  Halving this
+        # at 1080p saves ~50 MB per forward pass.
         out_flat = torch.empty([height * width * channels], device=values.device, dtype=values.dtype)
+        # final_T must be FP32: it is the running transmittance product
+        # T = prod(1 - alpha_i), which decays toward zero over 100+ Gaussians.
+        # BF16's 8-bit mantissa would collapse small transmittances to zero,
+        # causing incorrect background blending and backward T_i recovery.
         final_T_flat = torch.empty([height * width], device=values.device, dtype=torch.float32)
         stop_idx_flat = torch.empty([height * width], device=values.device, dtype=torch.int32)
         for tile_tid in hl.tile(tile_count):
@@ -278,10 +316,15 @@ def _make_raster_forward_kernel(*, static_shapes: bool, runtime_autotune: bool):
                 fy = hl.load(pixel_y, [py_idx], extra_mask=pixel_valid).to(torch.float32)
                 fx = hl.load(pixel_x, [px_idx], extra_mask=pixel_valid).to(torch.float32)
                 pixel_flat = py_idx * width + px_idx
+                # trans (running transmittance) must be FP32: it's a running
+                # product T *= (1-alpha) toward zero over 100+ Gaussians.
                 trans = hl.full([tile_tid, tile_pix], 1.0, dtype=torch.float32)
 
                 for tile_c in hl.tile(0, channels):
                     channel_valid = tile_c.index < channels
+                    # accum (weighted color sum) must be FP32: it accumulates
+                    # T*alpha*value over 100+ Gaussians.  BF16 would lose
+                    # small contributions from distant/transparent Gaussians.
                     accum = hl.zeros([tile_tid, tile_pix, tile_c], dtype=torch.float32)
                     trans_local = trans
                     for tile_k in hl.tile(0, max_nnz, block_size=chunk_size_static):
@@ -297,14 +340,28 @@ def _make_raster_forward_kernel(*, static_shapes: bool, runtime_autotune: bool):
                             # Helion 0.2 cannot lower helper-function calls that
                             # contain tensor indexing (aten.select.int), so the
                             # block must stay inline until that limitation is lifted.
+
+                            # xys stays FP32: sub-pixel precision required (BF16 ULP
+                            # at 1920 is ~8).  Explicit .to(float32) is kept because
+                            # xys is always FP32 and this documents the contract.
                             xy0 = xys[gid, 0].to(torch.float32)
                             xy1 = xys[gid, 1].to(torch.float32)
-                            conic0 = conic[gid, 0].to(torch.float32)
-                            conic1 = conic[gid, 1].to(torch.float32)
-                            conic2 = conic[gid, 2].to(torch.float32)
-                            rho_k = rho[gid].to(torch.float32)
-                            opacity_k = opacity[gid].to(torch.float32)
+                            # conic, rho, opacity: no explicit upcast needed.
+                            # These may be BF16 or FP32.  When BF16, they promote
+                            # to FP32 automatically when combined with the FP32
+                            # dx/dy (from FP32 pixel coords - FP32 xys) and FP32
+                            # accumulators (trans, accum).  Removing the redundant
+                            # .to(float32) saves register pressure and lets the
+                            # compiler load BF16 values directly.
+                            conic0 = conic[gid, 0]
+                            conic1 = conic[gid, 1]
+                            conic2 = conic[gid, 2]
+                            rho_k = rho[gid]
+                            opacity_k = opacity[gid]
 
+                            # dx, dy are FP32 (FP32 fx/fy - FP32 xy0/xy1), so all
+                            # subsequent arithmetic with BF16 conic/opacity/rho
+                            # promotes to FP32 via PyTorch type promotion rules.
                             dx = fx - xy0[:, None]
                             dy = fy - xy1[:, None]
                             sigma = (
@@ -322,7 +379,11 @@ def _make_raster_forward_kernel(*, static_shapes: bool, runtime_autotune: bool):
 
                             value_mask = valid_k[:, None] & channel_valid[None, :]
                             value_idx = gid[:, None] * channels + tile_c.index[None, :]
-                            value_k = hl.load(values_flat, [value_idx], extra_mask=value_mask).to(torch.float32)
+                            # values load: no upcast needed.  weight is FP32
+                            # (from FP32 trans_local * FP32 alpha), so the
+                            # weight * value_k multiply promotes BF16 value_k
+                            # to FP32, and accum is explicitly FP32.
+                            value_k = hl.load(values_flat, [value_idx], extra_mask=value_mask)
                             value_k = torch.where(value_mask, value_k, 0.0)
                             accum = accum + weight[:, :, None] * value_k[:, None, :]
                             trans_local = torch.where(accepted, trans_local * (1.0 - alpha), trans_local)
@@ -330,9 +391,13 @@ def _make_raster_forward_kernel(*, static_shapes: bool, runtime_autotune: bool):
                     out_idx = pixel_flat[:, :, None] * channels + tile_c.index[None, None, :]
                     out_mask = pixel_valid[:, :, None] & channel_valid[None, None, :]
                     if background_is_zero != 0:
+                        # Output in values.dtype: FP32 accum → BF16 when
+                        # values is BF16, giving half the output bandwidth.
                         out_chunk = accum.to(values.dtype)
                     else:
-                        bg = hl.load(background, [tile_c.index], extra_mask=channel_valid).to(torch.float32)
+                        # background load: no upcast needed.  trans_local is
+                        # FP32 so the multiply promotes BF16 bg to FP32.
+                        bg = hl.load(background, [tile_c.index], extra_mask=channel_valid)
                         bg = torch.where(channel_valid, bg, 0.0)
                         out_chunk = (accum + trans_local[:, :, None] * bg[None, None, :]).to(values.dtype)
                     hl.store(out_flat, [out_idx], out_chunk, extra_mask=out_mask)
@@ -394,6 +459,8 @@ def _make_visibility_stats_kernel(*, static_shapes: bool, runtime_autotune: bool
         antialiased = hl.specialize(antialiased_flag)
         chunk_size_static = hl.specialize(chunk_size_flag)
         gaussian_count = opacity.size(0)
+        # All visibility stat buffers are FP32: they are atomic accumulation
+        # targets from all pixels, same rationale as backward grad buffers.
         contrib = torch.zeros([gaussian_count], device=opacity.device, dtype=torch.float32)
         trans = torch.zeros_like(contrib)
         hits = torch.zeros_like(contrib)
@@ -418,6 +485,8 @@ def _make_visibility_stats_kernel(*, static_shapes: bool, runtime_autotune: bool
                 bx = (px_idx * error_bins_x) // width
                 by = (py_idx * error_bins_y) // height
                 bin_idx = by * error_bins_x + bx
+                # T (running transmittance) must be FP32: same as forward
+                # kernel's trans -- running product toward zero.
                 T = hl.full([tile_tid, tile_pix], 1.0, dtype=torch.float32)
                 for tile_k in hl.tile(0, max_nnz, block_size=chunk_size_static):
                     for k_inner in hl.static_range(chunk_size_static):
@@ -427,13 +496,17 @@ def _make_visibility_stats_kernel(*, static_shapes: bool, runtime_autotune: bool
                         gid = hl.load(sorted_vals, [intersect_idx], extra_mask=valid_k).to(torch.int64)
                         gid = torch.where(valid_k, gid, 0)
                         # NOTE: see forward kernel for why this block is inline.
+                        # xys: keep FP32 cast (sub-pixel precision, see fwd kernel).
                         xy0 = xys[gid, 0].to(torch.float32)
                         xy1 = xys[gid, 1].to(torch.float32)
-                        conic0 = conic[gid, 0].to(torch.float32)
-                        conic1 = conic[gid, 1].to(torch.float32)
-                        conic2 = conic[gid, 2].to(torch.float32)
-                        rho_k = rho[gid].to(torch.float32)
-                        opacity_k = opacity[gid].to(torch.float32)
+                        # conic, rho, opacity: no upcast -- same reasoning as
+                        # forward kernel.  FP32 dx/dy and FP32 T accumulator
+                        # promote any BF16 loads to FP32 arithmetic.
+                        conic0 = conic[gid, 0]
+                        conic1 = conic[gid, 1]
+                        conic2 = conic[gid, 2]
+                        rho_k = rho[gid]
+                        opacity_k = opacity[gid]
                         dx = fx - xy0[:, None]
                         dy = fy - xy1[:, None]
                         sigma = (
@@ -516,6 +589,10 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
         background_is_zero = hl.specialize(background_is_zero_flag)
         gaussian_count = xys.size(0)
         values_flat = values.view(-1)
+        # Gradient buffers: always FP32 -- these are atomic accumulation
+        # targets receiving contributions from many pixels (~2M at 1080p).
+        # BF16 atomics would lose small gradient contributions that fall
+        # below BF16 ULP relative to the running sum.
         grad_xys_flat = torch.zeros([gaussian_count * 2], device=xys.device, dtype=torch.float32)
         grad_conic_flat = torch.zeros([gaussian_count * 3], device=conic.device, dtype=torch.float32)
         grad_rho = torch.zeros([gaussian_count], device=rho.device, dtype=torch.float32)
@@ -540,7 +617,9 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
                 pixel_flat = py_idx * width + px_idx
                 final_T_pix = hl.load(final_T_flat, [pixel_flat], extra_mask=pixel_valid).to(torch.float32)
 
-                # Load per-pixel grad_out for each channel and compute suffix_dot
+                # suffix_dot and suffix_trans are FP32: they are running
+                # weighted sums/products accumulated over all Gaussians in
+                # reverse order, same precision requirement as forward trans/accum.
                 # suffix_dot = dot(grad_out_p, background) initially when bg != 0
                 suffix_dot = hl.zeros([tile_tid, tile_pix], dtype=torch.float32)
                 suffix_trans = hl.full([tile_tid, tile_pix], 1.0, dtype=torch.float32)
@@ -548,8 +627,11 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
                 if background_is_zero == 0:
                     for c in range(channels):
                         go_idx = pixel_flat * channels + c
-                        go_c = hl.load(grad_out_flat, [go_idx], extra_mask=pixel_valid).to(torch.float32)
-                        bg_c = background[c].to(torch.float32)
+                        # grad_out load: no upcast needed.  suffix_dot is FP32,
+                        # so BF16 go_c promotes to FP32 in the multiply+add.
+                        go_c = hl.load(grad_out_flat, [go_idx], extra_mask=pixel_valid)
+                        # background load: same -- suffix_dot FP32 drives promotion.
+                        bg_c = background[c]
                         suffix_dot = suffix_dot + go_c * bg_c
 
                 # Iterate gaussians in REVERSE order
@@ -563,13 +645,17 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
                         gid = torch.where(valid_k, gid, 0)
 
                         # NOTE: see forward kernel for why this block is inline.
+                        # xys: keep FP32 cast (sub-pixel precision, see fwd kernel).
                         xy0 = xys[gid, 0].to(torch.float32)
                         xy1 = xys[gid, 1].to(torch.float32)
-                        conic0 = conic[gid, 0].to(torch.float32)
-                        conic1 = conic[gid, 1].to(torch.float32)
-                        conic2 = conic[gid, 2].to(torch.float32)
-                        rho_k = rho[gid].to(torch.float32)
-                        opacity_k = opacity[gid].to(torch.float32)
+                        # conic, rho, opacity: no upcast -- FP32 dx/dy and FP32
+                        # accumulators (suffix_dot, suffix_trans, dot_grad_value)
+                        # promote any BF16 loads to FP32 arithmetic.
+                        conic0 = conic[gid, 0]
+                        conic1 = conic[gid, 1]
+                        conic2 = conic[gid, 2]
+                        rho_k = rho[gid]
+                        opacity_k = opacity[gid]
 
                         dx = fx - xy0[:, None]
                         dy = fy - xy1[:, None]
@@ -597,15 +683,22 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
                         weight_i = T_i * alpha
 
                         # --- Compute dot(grad_out, value) for this gaussian ---
-                        # Use Python-level unroll for channels inside static_range
+                        # Use Python-level unroll for channels inside static_range.
+                        # dot_grad_value must be FP32: it accumulates the per-pixel
+                        # dot product over C channels, feeding into dL/dalpha.
                         gid_2d = gid[:, None] + hl.zeros([tile_tid, tile_pix], dtype=torch.int64)
                         dot_grad_value = hl.zeros([tile_tid, tile_pix], dtype=torch.float32)
                         for c in range(channels):
                             go_idx = pixel_flat * channels + c
-                            go_c = hl.load(grad_out_flat, [go_idx], extra_mask=pixel_valid).to(torch.float32)
+                            # grad_out and values loads: no upcast needed.
+                            # dot_grad_value is FP32, so BF16 go_c * BF16 v_c
+                            # promotes to FP32 when accumulated into
+                            # dot_grad_value.  weight_i is also FP32 (from
+                            # FP32 T_i * alpha), so gv_contrib below is FP32.
+                            go_c = hl.load(grad_out_flat, [go_idx], extra_mask=pixel_valid)
                             go_c = torch.where(pixel_valid, go_c, 0.0)
                             val_idx = gid_2d * channels + c
-                            v_c = hl.load(values_flat, [val_idx], extra_mask=valid_mask).to(torch.float32)
+                            v_c = hl.load(values_flat, [val_idx], extra_mask=valid_mask)
                             v_c = torch.where(valid_mask, v_c, 0.0)
                             dot_grad_value = dot_grad_value + go_c * v_c
 
@@ -711,6 +804,36 @@ def _helion_rasterize_values_forward_impl(
     )
     prepared = prepare_visibility_from_projection(projection, width=int(width), height=int(height), cfg=cfg)
     prepared = _stabilize_prepared_visibility(prepared)
+
+    # Downcast projection outputs (conic, rho) and opacity to match values
+    # dtype when running in mixed precision.  Conic and rho have bounded
+    # magnitude and are consumed via type promotion from FP32 dx/dy in the
+    # kernel, so BF16 is safe.  Opacity is [0,1] from sigmoid.
+    # xys stays FP32 (sub-pixel precision; BF16 ULP at 1920 ≈ 8).
+    values_dtype = values.dtype
+    if values_dtype != torch.float32:
+        prepared = PreparedVisibility(
+            xys=prepared.xys,  # stays FP32: sub-pixel precision required
+            conic=prepared.conic.to(values_dtype),
+            rho=prepared.rho.to(values_dtype),
+            num_tiles_hit=prepared.num_tiles_hit,
+            tile_start=prepared.tile_start,
+            tile_end=prepared.tile_end,
+            sorted_vals=prepared.sorted_vals,
+            width=prepared.width,
+            height=prepared.height,
+            tile_size=prepared.tile_size,
+            tiles_x=prepared.tiles_x,
+            tiles_y=prepared.tiles_y,
+            tile_count=prepared.tile_count,
+            gaussian_count_value=prepared.gaussian_count,
+            intersection_count_value=prepared.intersection_count,
+        )
+        # opacity may arrive as FP32 (from field sigmoid output); downcast
+        # to match values dtype.  Opacity is bounded [0,1], safe for BF16.
+        if opacity.dtype != values_dtype:
+            opacity = opacity.to(values_dtype)
+
     kernel = _make_raster_forward_kernel(
         static_shapes=cfg.helion_static_shapes,
         runtime_autotune=cfg.helion_runtime_autotune,

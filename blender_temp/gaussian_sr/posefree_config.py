@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field as dc_field
 from typing import Literal
 
+import torch
+
 
 @dataclass
 class CameraInit:
@@ -156,6 +158,24 @@ class TrainConfig:
 
 
 @dataclass
+class PrecisionConfig:
+    # Dtype for packed values, opacity, conic, rho, background, and render output.
+    # BF16 is safe here: these tensors have bounded values ([0,1] for RGB/opacity,
+    # moderate for conics/latent) and are consumed in FP32 arithmetic via type
+    # promotion from FP32 pixel coordinates (xys) and FP32 accumulators (trans,
+    # accum).  Halving these tensors saves ~100 MB per fwd+bwd at 1080p with 65K
+    # Gaussians and reduces global memory bandwidth in the rasterization kernels.
+    # Field parameters (means3d, quat, log_scale, etc.) always stay FP32 because
+    # Adam optimizer eps=1e-15 requires FP32 state, and xys stays FP32 because
+    # BF16 ULP at 1920 is ~8, destroying sub-pixel precision.
+    values_dtype: Literal["float32", "bfloat16"] = "float32"
+
+    def resolve_values_dtype(self) -> torch.dtype:
+        """Return the torch.dtype corresponding to ``values_dtype``."""
+        return torch.bfloat16 if self.values_dtype == "bfloat16" else torch.float32
+
+
+@dataclass
 class PoseFreeGaussianConfig:
     camera: CameraInit = dc_field(default_factory=CameraInit)
     render: RenderConfig = dc_field(default_factory=RenderConfig)
@@ -164,6 +184,7 @@ class PoseFreeGaussianConfig:
     density: DensityControlConfig = dc_field(default_factory=DensityControlConfig)
     field: FieldConfig = dc_field(default_factory=FieldConfig)
     train: TrainConfig = dc_field(default_factory=TrainConfig)
+    precision: PrecisionConfig = dc_field(default_factory=PrecisionConfig)
 
 
 __all__ = [
@@ -174,5 +195,6 @@ __all__ = [
     "DensityControlConfig",
     "FieldConfig",
     "TrainConfig",
+    "PrecisionConfig",
     "PoseFreeGaussianConfig",
 ]

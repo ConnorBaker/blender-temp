@@ -1323,9 +1323,19 @@ def render_values_warp(
 ) -> Tensor | tuple[Tensor, PreparedVisibility]:
     if cfg is None:
         cfg = RasterConfig()
+    # Warp kernels require FP32 for all inputs -- they have no mixed-precision
+    # support.  Upcast BF16 values/opacity/background at the entry point.
+    # This is a simple fallback; the Helion backend is the performance-critical
+    # path where BF16 savings matter.
+    if values.dtype != torch.float32:
+        values = values.float()
+    if opacity.dtype != torch.float32:
+        opacity = opacity.float()
     background_is_zero = background is None
     if background is None:
         background = torch.zeros(values.shape[1], device=values.device, dtype=values.dtype)
+    elif background.dtype != torch.float32:
+        background = background.float()
     if active_count is not None:
         count = max(0, min(int(active_count), int(means.shape[0])))
         means = means[:count]
@@ -1400,6 +1410,9 @@ def render_stats_prepared_warp(
         cfg = RasterConfig()
     if active_count is not None:
         opacity = opacity[: int(active_count)]
+    # Warp stats kernel requires FP32; upcast BF16 opacity at the entry point.
+    if opacity.dtype != torch.float32:
+        opacity = opacity.float()
     _assert_cuda_float32_contiguous(opacity, "opacity")
     _assert_1d(opacity, "opacity")
     if int(opacity.shape[0]) != prepared.gaussian_count:

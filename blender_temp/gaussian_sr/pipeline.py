@@ -501,12 +501,22 @@ class PoseFreeGaussianSR(nn.Module):
 
     def _packed_values(self, rgb: Tensor, latent: Tensor) -> Tensor:
         alpha_one = torch.ones(rgb.shape[0], 1, device=rgb.device, dtype=rgb.dtype)
-        return torch.cat((rgb, latent, alpha_one), dim=-1)
+        packed = torch.cat((rgb, latent, alpha_one), dim=-1)
+        # Downcast packed values to the configured render dtype (FP32 or BF16).
+        # Field outputs (rgb from sigmoid, latent, alpha=1) are bounded in [0,1]
+        # or moderate magnitude, so BF16 is safe.  The rasterization kernel loads
+        # these per-Gaussian per-pixel; halving the dtype halves the bandwidth
+        # of the main memory bottleneck.  The .to() is a no-op when already FP32.
+        render_dtype = self.config.precision.resolve_values_dtype()
+        return packed.to(render_dtype) if render_dtype != packed.dtype else packed
 
     def _packed_background(self, device: torch.device, dtype: torch.dtype) -> Tensor:
+        # Background must match values dtype for consistency in the kernel's
+        # output blending (accum + trans * bg).to(values.dtype).
+        render_dtype = self.config.precision.resolve_values_dtype()
         c = 3 + self.config.field.feature_dim + 1
-        bg = torch.zeros(c, device=device, dtype=dtype)
-        bg[:3] = torch.tensor(self.config.render.bg_color, device=device, dtype=dtype)
+        bg = torch.zeros(c, device=device, dtype=render_dtype)
+        bg[:3] = torch.tensor(self.config.render.bg_color, device=device, dtype=render_dtype)
         return bg
 
     def _render_inputs(self, field: dict[str, Tensor | None], R_cw: Tensor, t_cw: Tensor, intrinsics: Tensor):

@@ -90,12 +90,18 @@ def make_gaussian_kernel(
 
 def ssim_value(x: Tensor, y: Tensor, window_size: int = 11, sigma: float = 1.5) -> Tensor:
     assert x.shape == y.shape and x.dim() == 3
-    c = x.shape[0]
-    kernel = make_gaussian_kernel(window_size, sigma, c, x.device, x.dtype)
+    # SSIM variance computation (E[x^2] - E[x]^2) is precision-sensitive:
+    # catastrophic cancellation when E[x]^2 ≈ E[x^2].  Upcast BF16 inputs
+    # to FP32 so that the Gaussian-weighted convolutions and the subtraction
+    # both run in full precision.  FP32 inputs pass through with no copy.
+    x_f = x.float()
+    y_f = y.float()
+    c = x_f.shape[0]
+    kernel = make_gaussian_kernel(window_size, sigma, c, x_f.device, x_f.dtype)
     pad = window_size // 2
 
-    x_b = x.unsqueeze(0)
-    y_b = y.unsqueeze(0)
+    x_b = x_f.unsqueeze(0)
+    y_b = y_f.unsqueeze(0)
 
     mu_x = F.conv2d(x_b, kernel, padding=pad, groups=c)
     mu_y = F.conv2d(y_b, kernel, padding=pad, groups=c)
@@ -111,7 +117,11 @@ def ssim_value(x: Tensor, y: Tensor, window_size: int = 11, sigma: float = 1.5) 
     c1 = 0.01**2
     c2 = 0.03**2
     luminance = (2.0 * mu_xy + c1) / (mu_x2 + mu_y2 + c1)
-    contrast_structure = (2.0 * sigma_xy + c2) / (sigma_x2 + sigma_y2 + c2).clamp_min(torch.finfo(x.dtype).tiny)
+    # Use a fixed epsilon (1e-12) instead of dtype-dependent finfo.tiny:
+    # finfo(bfloat16).tiny is ~1.2e-38 which underflows to zero in FP32
+    # intermediate computation; 1e-12 is safely above FP32 subnormal range
+    # while still negligible relative to the c2=0.0009 SSIM constant.
+    contrast_structure = (2.0 * sigma_xy + c2) / (sigma_x2 + sigma_y2 + c2).clamp_min(1e-12)
     ssim_map = luminance * contrast_structure
     return ssim_map.mean().clamp(0.0, 1.0)
 

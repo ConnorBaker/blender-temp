@@ -736,6 +736,18 @@ def setup_argparse() -> ArgumentParser:
         action="store_true",
         help="Run projection-only stage preflight checks, write preflight.json, and exit without training",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="Global RNG seed for reproducibility (seeds Python, PyTorch, and CUDA)",
+        default=None,
+    )
+    parser.add_argument(
+        "--values-dtype",
+        choices=("float32", "bfloat16"),
+        help="Dtype for rasterization values/opacity/background; bfloat16 halves bandwidth",
+        default="float32",
+    )
     return parser
 
 
@@ -1027,6 +1039,19 @@ def main() -> None:
     disable_runtime_observer: bool = bool(args.disable_runtime_observer)
     allow_unsafe_config: bool = bool(args.allow_unsafe_config)
     preflight_only: bool = bool(args.preflight_only)
+    seed: int | None = args.seed
+    values_dtype: str = args.values_dtype
+
+    # Seed all RNGs for reproducibility.
+    if seed is not None:
+        random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        # Make cuDNN deterministic (slight perf cost).
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        LOGGER.info("Seeded all RNGs with seed=%d (deterministic mode)", seed)
 
     if not input_dir.is_dir():
         LOGGER.error("Input directory not found: %s", input_dir)
@@ -1198,6 +1223,7 @@ def main() -> None:
         RenderConfig,
         TrainConfig,
     )
+    from blender_temp.gaussian_sr.posefree_config import PrecisionConfig
     from blender_temp.gaussian_sr.pipeline import set_torch_compile_enabled
 
     images = batch
@@ -1229,6 +1255,8 @@ def main() -> None:
 
     if renderer_backend is not None:
         cfg.render.backend = renderer_backend
+    # CLI --values-dtype always takes effect (including over resumed configs).
+    cfg.precision = PrecisionConfig(values_dtype=values_dtype)
 
     intrinsics = None
     estimated_gaussians = estimate_initial_gaussian_count(images.shape[-2], images.shape[-1], cfg.field.anchor_stride)
