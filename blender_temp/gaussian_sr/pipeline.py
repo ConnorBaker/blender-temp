@@ -457,11 +457,8 @@ class PoseFreeGaussianSR(nn.Module):
             and rgb is not None
             and latent is not None
         )
-        active_count = (
-            int(field.get("active_count", means3d.shape[0]).item())
-            if field.get("active_count") is not None
-            else int(means3d.shape[0])
-        )
+        ac = field.get("active_count")
+        active_count = ac if isinstance(ac, Tensor) else means3d.shape[0]
         values = self._packed_values(rgb, latent)
         background = self._packed_background(values.device, values.dtype)
         return viewmat, K, means3d, quat, scale, opacity, values, background, active_count
@@ -544,7 +541,7 @@ class PoseFreeGaussianSR(nn.Module):
         K: Tensor,
         out_h: int,
         out_w: int,
-        active_count: int,
+        active_count: int | Tensor,
     ) -> tuple[Tensor, PreparedVisibility, tuple[Tensor, ...]]:
         packed_hwc, prepared = render_values(
             means=means.contiguous(),
@@ -1383,6 +1380,14 @@ class PoseFreeGaussianSR(nn.Module):
             step_start_index = max(0, resume_step_index + 1) if stage_idx == resume_stage_index else 0
             if step_start_index >= int(steps):
                 continue
+            # Reset optimizer at stage transitions to clear stale Adam momentum/variance,
+            # and scale LR down proportionally to the resolution increase.
+            if stage_idx > 0 and stage_idx != resume_stage_index:
+                opt = self._make_optimizer(train_cfg)
+                lr_scale = float(train_cfg.stage_scales[0]) / float(stage_scale)
+                for pg in opt.param_groups:
+                    pg["lr"] = pg["lr"] * lr_scale
+                self._debug_optimizer = opt
             final_stage_loss_window: deque[float] = deque(
                 maxlen=max(1, int(getattr(train_cfg, "final_stage_early_stop_patience", 0)))
             )
