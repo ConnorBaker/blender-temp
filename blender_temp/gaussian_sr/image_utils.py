@@ -81,7 +81,7 @@ def make_gaussian_kernel(
     coords = torch.arange(window_size, device=device, dtype=dtype) - (window_size - 1) / 2.0
     kernel_1d = torch.exp(-0.5 * (coords / sigma) ** 2)
     kernel_1d = kernel_1d / kernel_1d.sum()
-    kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]
+    kernel_2d = torch.outer(kernel_1d, kernel_1d)
     kernel = kernel_2d.expand(channels, 1, window_size, window_size).contiguous()
     if use_cache:
         _GAUSSIAN_KERNEL_CACHE[key] = kernel
@@ -117,18 +117,14 @@ def ssim_value(x: Tensor, y: Tensor, window_size: int = 11, sigma: float = 1.5) 
 
 
 def charbonnier(x: Tensor, eps: float = 1.0e-3) -> Tensor:
-    return torch.sqrt(x * x + eps * eps)
+    return torch.hypot(x, x.new_tensor(eps))
 
 
 def tv_loss_grid(x: Tensor) -> Tensor:
-    if x.dim() == 2:
-        dx = x[:, 1:] - x[:, :-1]
-        dy = x[1:, :] - x[:-1, :]
-    elif x.dim() == 3:
-        dx = x[:, :, 1:] - x[:, :, :-1]
-        dy = x[:, 1:, :] - x[:, :-1, :]
-    else:
+    if x.dim() not in (2, 3):
         raise ValueError(f"Unsupported tensor rank for tv_loss_grid: {x.dim()}")
+    dx = torch.diff(x, dim=-1)
+    dy = torch.diff(x, dim=-2)
     return dx.abs().mean() + dy.abs().mean()
 
 
@@ -142,8 +138,7 @@ def estimate_phase_correlation_shift(ref_rgb: Tensor, src_rgb: Tensor) -> Tensor
     corr = torch.fft.irfft2(cross, s=ref.shape)
     peak = corr.argmax()
     h, w = ref.shape
-    peak_y = torch.div(peak, w, rounding_mode="floor")
-    peak_x = peak - peak_y * w
+    peak_y, peak_x = torch.unravel_index(peak, (h, w))
     peak_y = peak_y.to(ref.dtype)
     peak_x = peak_x.to(ref.dtype)
 

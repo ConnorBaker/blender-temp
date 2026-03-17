@@ -7,8 +7,7 @@ from .posefree_config import CameraInit
 
 
 def inverse_sigmoid(x: Tensor, eps: float = 1.0e-6) -> Tensor:
-    x = x.clamp(eps, 1.0 - eps)
-    return torch.log(x) - torch.log1p(-x)
+    return torch.special.logit(x, eps=eps)
 
 
 def softplus_inverse(y: Tensor) -> Tensor:
@@ -62,7 +61,7 @@ def pose_vec_to_rt(xi: Tensor) -> tuple[Tensor, Tensor]:
 
 
 def normalize_quaternion(q: Tensor, eps: float = 1.0e-8) -> Tensor:
-    return q / q.norm(dim=-1, keepdim=True).clamp_min(eps)
+    return torch.nn.functional.normalize(q, dim=-1, eps=eps)
 
 
 def quaternion_to_matrix(q: Tensor) -> Tensor:
@@ -92,8 +91,8 @@ def quaternion_to_matrix(q: Tensor) -> Tensor:
 
 def covariance_from_quat_scale(quat: Tensor, scale: Tensor) -> Tensor:
     r = quaternion_to_matrix(quat)
-    s2 = torch.diag_embed(scale * scale)
-    return r @ s2 @ r.transpose(-1, -2)
+    rs = r * scale.unsqueeze(-2)
+    return rs @ rs.transpose(-1, -2)
 
 
 def default_intrinsics(
