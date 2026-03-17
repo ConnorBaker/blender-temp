@@ -371,15 +371,61 @@ class PoseFreeGaussianSR(nn.Module):
         )
 
     def _make_optimizer(self, train_cfg: TrainConfig) -> torch.optim.Optimizer:
-        params: list[dict[str, object]] = [
-            {"params": list(self.field_model.parameters_for_optimizer()), "lr": train_cfg.lr_field},
-            {"params": list(self.camera_model.parameters()), "lr": train_cfg.lr_camera},
+        # Per-parameter learning rates following 3DGS (Kerbl et al., 2023).
+        # Each gaussian attribute gets its own LR; position LR is decayed
+        # separately via a scheduler (see _make_position_lr_scheduler).
+        fp = self.field_model.optimizer_param_dict()
+        param_groups: list[dict[str, object]] = [
+            {"params": [fp["means3d"]], "lr": train_cfg.lr_position, "name": "position"},
+            {"params": [fp["quat_raw"]], "lr": train_cfg.lr_rotation, "name": "rotation"},
+            {"params": [fp["log_scale"]], "lr": train_cfg.lr_scaling, "name": "scaling"},
+            {"params": [fp["opacity_logit"]], "lr": train_cfg.lr_opacity, "name": "opacity"},
+            {"params": [fp["rgb_logit"]], "lr": train_cfg.lr_color, "name": "color"},
+            {"params": [fp["latent"]], "lr": train_cfg.lr_latent, "name": "latent"},
         ]
+        if "sh_coeffs" in fp:
+            param_groups.append({"params": [fp["sh_coeffs"]], "lr": train_cfg.lr_sh, "name": "sh"})
+        param_groups.append({"params": list(self.camera_model.parameters()), "lr": train_cfg.lr_camera, "name": "camera"})
         if self.config.camera.learn_intrinsics:
-            params.append({"params": list(self.intrinsics.parameters()), "lr": train_cfg.lr_camera})
+            param_groups.append({"params": list(self.intrinsics.parameters()), "lr": train_cfg.lr_camera, "name": "intrinsics"})
         if self.residual_head is not None:
-            params.append({"params": list(self.residual_head.parameters()), "lr": train_cfg.lr_residual})
-        return torch.optim.Adam(params)
+            param_groups.append({"params": list(self.residual_head.parameters()), "lr": train_cfg.lr_residual, "name": "residual"})
+        # Adam epsilon=1e-15 follows 3DGS; much smaller than PyTorch default
+        # (1e-8).  This prevents the adaptive LR from being dominated by
+        # epsilon when second-moment estimates are very small.
+        return torch.optim.Adam(param_groups, eps=1e-15)
+
+    @staticmethod
+    def _make_position_lr_scheduler(
+        opt: torch.optim.Optimizer,
+        lr_init: float,
+        lr_final: float,
+        max_steps: int,
+    ) -> torch.optim.lr_scheduler.LambdaLR:
+        """Log-linear position LR decay, constant for all other param groups.
+
+        Follows 3DGS (Kerbl et al., 2023) which decays only position LR via
+        ``lr = lr_init^(1-t) * lr_final^t`` where ``t = step / max_steps``.
+        Borrowed originally from Plenoxels (Fridovich-Keil et al., 2022).
+        """
+        import math
+
+        position_idx: int | None = None
+        for i, pg in enumerate(opt.param_groups):
+            if pg.get("name") == "position":
+                position_idx = i
+                break
+        log_ratio = math.log(lr_final / lr_init) if lr_init > 0 and lr_final > 0 else 0.0
+
+        def _lr_lambda(step: int, group_idx: int = 0) -> float:
+            if group_idx != position_idx or max_steps <= 0:
+                return 1.0
+            t = min(step / max_steps, 1.0)
+            return math.exp(log_ratio * t)
+
+        return torch.optim.lr_scheduler.LambdaLR(
+            opt, [lambda step, gi=i: _lr_lambda(step, gi) for i in range(len(opt.param_groups))]
+        )
 
     def _rebuild_optimizer_after_density(
         self,
@@ -388,7 +434,30 @@ class PoseFreeGaussianSR(nn.Module):
         survivor_sources: Tensor | None,
         appended_count: int,
     ) -> torch.optim.Optimizer:
-        del train_cfg, survivor_sources, appended_count
+        """Zero Adam momentum/variance for newly activated gaussian rows.
+
+        Following 3DGS (Kerbl et al., 2023), which zero-initializes optimizer
+        state for new gaussians created during density control
+        (``cat_tensors_to_optimizer`` appends zeros to ``exp_avg`` and
+        ``exp_avg_sq``).  Our fixed-capacity approach pre-allocates parameter
+        tensors, so we zero the Adam state for the newly activated tail rows.
+        """
+        del train_cfg, survivor_sources
+        if appended_count <= 0:
+            return old_opt
+        new_active = self.field_model.num_gaussians
+        new_start = new_active - appended_count
+        for pg in old_opt.param_groups:
+            if pg.get("name") in ("camera", "intrinsics", "residual"):
+                continue
+            for param in pg["params"]:
+                state = old_opt.state.get(param)
+                if state is None:
+                    continue
+                for key in ("exp_avg", "exp_avg_sq"):
+                    buf = state.get(key)
+                    if buf is not None:
+                        buf[new_start:new_active].zero_()
         return old_opt
 
     def _scale_intrinsics(self, out_h: int, out_w: int) -> Tensor:
@@ -1346,6 +1415,8 @@ class PoseFreeGaussianSR(nn.Module):
                     if isinstance(value, torch.Tensor):
                         state[key] = value.to(device=images.device)
         self._debug_optimizer = opt
+        # Position LR scheduler: will be (re-)created at each stage start.
+        lr_scheduler: torch.optim.lr_scheduler.LambdaLR | None = None
         history: dict[str, list] = {"loss": [], "photo": [], "reg": [], "num_gaussians": [], "density_events": []}
 
         progress_enabled = bool(
@@ -1388,6 +1459,18 @@ class PoseFreeGaussianSR(nn.Module):
                 for pg in opt.param_groups:
                     pg["lr"] = pg["lr"] * lr_scale
                 self._debug_optimizer = opt
+            # Position LR exponential decay following 3DGS / Plenoxels.
+            # The position group's base LR (after stage scaling) decays
+            # log-linearly to lr_position_final over this stage's steps.
+            pos_lr_now = train_cfg.lr_position
+            if stage_idx > 0:
+                pos_lr_now *= float(train_cfg.stage_scales[0]) / float(stage_scale)
+            lr_scheduler = self._make_position_lr_scheduler(
+                opt,
+                lr_init=pos_lr_now,
+                lr_final=train_cfg.lr_position_final,
+                max_steps=int(steps),
+            )
             final_stage_loss_window: deque[float] = deque(
                 maxlen=max(1, int(getattr(train_cfg, "final_stage_early_stop_patience", 0)))
             )
@@ -1527,6 +1610,8 @@ class PoseFreeGaussianSR(nn.Module):
                         loss = step_out[0].clone()
                         photo_loss = step_out[1].clone()
                         reg_loss = step_out[2].clone()
+                        if lr_scheduler is not None:
+                            lr_scheduler.step()
                         if not bool(step_out[3].item()):
                             self._raise_nonfinite("render_rgb", stage_idx, step, global_step)
                         if not bool(step_out[4].item()):
@@ -1834,6 +1919,8 @@ class PoseFreeGaussianSR(nn.Module):
                             opt_step_start = time.perf_counter()
                         with torch.profiler.record_function("pipeline.optimizer_step"):
                             opt.step()
+                        if lr_scheduler is not None:
+                            lr_scheduler.step()
                         if timing_enabled:
                             self._sync_for_timing(images.device)
                             opt_step_s = time.perf_counter() - opt_step_start
