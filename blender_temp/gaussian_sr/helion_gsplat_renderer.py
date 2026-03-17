@@ -113,6 +113,14 @@ def _helion_raster_chunk_size() -> int:
     return value
 
 
+def _helion_raster_backward_chunk_size() -> int:
+    raw = os.environ.get("BLENDER_TEMP_HELION_RASTER_BACKWARD_CHUNK", "1")
+    value = int(raw)
+    if value <= 0:
+        raise ValueError(f"BLENDER_TEMP_HELION_RASTER_BACKWARD_CHUNK must be > 0, got {value}")
+    return value
+
+
 def clear_helion_kernel_cache() -> None:
     """Clear all cached Helion kernel compilations and saved configs."""
     _load_saved_helion_configs.cache_clear()
@@ -443,11 +451,15 @@ def _make_visibility_stats_kernel(*, static_shapes: bool, runtime_autotune: bool
                         trans_i = torch.where(accepted, T, 0.0)
                         hit_i = torch.where(accepted, 1.0, 0.0)
                         residual_i = w_i * pixel_residual
+                        reduced_w_i = torch.sum(w_i, dim=-1)
+                        reduced_trans_i = torch.sum(trans_i, dim=-1)
+                        reduced_hit_i = torch.sum(hit_i, dim=-1)
+                        reduced_residual_i = torch.sum(residual_i, dim=-1)
+                        hl.atomic_add(contrib, [gid], reduced_w_i)
+                        hl.atomic_add(trans, [gid], reduced_trans_i)
+                        hl.atomic_add(hits, [gid], reduced_hit_i)
+                        hl.atomic_add(residual, [gid], reduced_residual_i)
                         gid_idx = gid[:, None] + hl.zeros([tile_tid, tile_pix], dtype=torch.int64)
-                        hl.atomic_add(contrib, [gid_idx], w_i)
-                        hl.atomic_add(trans, [gid_idx], trans_i)
-                        hl.atomic_add(hits, [gid_idx], hit_i)
-                        hl.atomic_add(residual, [gid_idx], residual_i)
                         hl.atomic_add(error_map, [gid_idx, bin_idx], residual_i)
                         T = torch.where(accepted, T * (1.0 - alpha), T)
         return contrib, trans, hits, residual, error_map
@@ -597,9 +609,10 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
                             v_c = torch.where(valid_mask, v_c, 0.0)
                             dot_grad_value = dot_grad_value + go_c * v_c
 
-                            # grad_values: accumulate weight_i * grad_out_c
+                            # grad_values: reduce over pixels, then single atomic per tile
                             gv_contrib = torch.where(accepted, weight_i * go_c, 0.0)
-                            hl.atomic_add(grad_values_flat, [val_idx], gv_contrib)
+                            reduced_gv = torch.sum(gv_contrib, dim=-1)
+                            hl.atomic_add(grad_values_flat, [gid * channels + c], reduced_gv)
 
                         # --- dL/dalpha ---
                         dL_dalpha = torch.where(accepted, T_i * (dot_grad_value - suffix_dot), 0.0)
@@ -611,14 +624,14 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
                         if antialiased != 0:
                             # grad_rho += dL_dalpha * alpha_base (only when unclamped)
                             grad_rho_contrib = torch.where(unclamped_accepted, dL_dalpha * alpha_base, 0.0)
-                            gid_idx = gid[:, None] + hl.zeros([tile_tid, tile_pix], dtype=torch.int64)
-                            hl.atomic_add(grad_rho, [gid_idx], grad_rho_contrib)
+                            reduced_grad_rho = torch.sum(grad_rho_contrib, dim=-1)
+                            hl.atomic_add(grad_rho, [gid], reduced_grad_rho)
                             dL_dalpha_base = torch.where(unclamped_accepted, dL_dalpha_base * rho_k[:, None], dL_dalpha_base)
 
                         # grad_opacity += dL_dalpha_base * weight_exp (only when unclamped)
                         grad_opacity_contrib = torch.where(unclamped_accepted, dL_dalpha_base * weight_exp, 0.0)
-                        gid_idx_op = gid[:, None] + hl.zeros([tile_tid, tile_pix], dtype=torch.int64)
-                        hl.atomic_add(grad_opacity, [gid_idx_op], grad_opacity_contrib)
+                        reduced_grad_opacity = torch.sum(grad_opacity_contrib, dim=-1)
+                        hl.atomic_add(grad_opacity, [gid], reduced_grad_opacity)
 
                         # dL/dsigma = -dL_dalpha_base * alpha_base
                         dL_dsigma = torch.where(unclamped_accepted, -dL_dalpha_base * alpha_base, 0.0)
@@ -627,8 +640,10 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
                         #           dL/dy = -dL_dsigma * (conic2*dy + conic1*dx)
                         dL_dx = -dL_dsigma * (conic0[:, None] * dx + conic1[:, None] * dy)
                         dL_dy = -dL_dsigma * (conic2[:, None] * dy + conic1[:, None] * dx)
-                        hl.atomic_add(grad_xys_flat, [gid_2d * 2], dL_dx)
-                        hl.atomic_add(grad_xys_flat, [gid_2d * 2 + 1], dL_dy)
+                        reduced_dL_dx = torch.sum(dL_dx, dim=-1)
+                        reduced_dL_dy = torch.sum(dL_dy, dim=-1)
+                        hl.atomic_add(grad_xys_flat, [gid * 2], reduced_dL_dx)
+                        hl.atomic_add(grad_xys_flat, [gid * 2 + 1], reduced_dL_dy)
 
                         # grad_conic: dL/dA = dL_dsigma * 0.5 * dx*dx
                         #             dL/dB = dL_dsigma * dx*dy
@@ -636,9 +651,12 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
                         dL_dA = dL_dsigma * 0.5 * dx * dx
                         dL_dB = dL_dsigma * dx * dy
                         dL_dC = dL_dsigma * 0.5 * dy * dy
-                        hl.atomic_add(grad_conic_flat, [gid_2d * 3], dL_dA)
-                        hl.atomic_add(grad_conic_flat, [gid_2d * 3 + 1], dL_dB)
-                        hl.atomic_add(grad_conic_flat, [gid_2d * 3 + 2], dL_dC)
+                        reduced_dL_dA = torch.sum(dL_dA, dim=-1)
+                        reduced_dL_dB = torch.sum(dL_dB, dim=-1)
+                        reduced_dL_dC = torch.sum(dL_dC, dim=-1)
+                        hl.atomic_add(grad_conic_flat, [gid * 3], reduced_dL_dA)
+                        hl.atomic_add(grad_conic_flat, [gid * 3 + 1], reduced_dL_dB)
+                        hl.atomic_add(grad_conic_flat, [gid * 3 + 2], reduced_dL_dC)
 
                         # Update suffix accumulators
                         suffix_dot = torch.where(
@@ -833,7 +851,7 @@ def _helion_rasterize_values_backward_impl(
             prepared.tile_size,
             int(cfg.rasterize_mode == "antialiased"),
             int(bool(torch.count_nonzero(background).item() == 0)),
-            _helion_raster_chunk_size(),
+            _helion_raster_backward_chunk_size(),
             float(cfg.alpha_min),
             float(cfg.transmittance_eps),
             float(cfg.clamp_alpha_max),
