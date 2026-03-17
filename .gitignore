@@ -5,4 +5,4 @@ render*/
 result*
 .pytest_cache
 .hypothesis
-temp-output*
+temp*

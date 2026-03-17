@@ -1,4 +1,8 @@
+import helion  # type: ignore[import-untyped]
+import helion.language as hl  # type: ignore[import-untyped]
+
 from .appearance import apply_view_dependent_rgb, num_sh_bases, sh_basis
+from .benchmarking import aggregate_step_metrics, compare_render_summary, select_compare_views, summarize_render_output
 from .camera import LearnableCameraBundle, LearnableSharedIntrinsics
 from .density_control import (
     apply_density_control,
@@ -19,6 +23,33 @@ from .density_control import (
 )
 from .density_logging import DensityEventCallback, append_density_event_jsonl, emit_density_event
 from .field import CanonicalGaussianField, ScaleAwareResidualHead
+from .fixed_capacity import (
+    CapacityAppendResult,
+    append_rows_in_place,
+    available_capacity,
+    compact_rows_in_place,
+    resolve_capacity,
+)
+from .gsplat_renderer import (
+    clear_renderer_caches,
+    prepare_visibility,
+    render_gaussians,
+    render_projection_meta,
+    render_stats,
+    render_stats_prepared,
+    render_values,
+    render_visibility_meta,
+)
+from .helion_gsplat_renderer import (
+    helion_rasterize_values_op,
+    prepare_visibility_helion,
+    render_gaussians_helion,
+    render_projection_meta_helion,
+    render_stats_helion,
+    render_stats_prepared_helion,
+    render_values_helion,
+    render_visibility_meta_helion,
+)
 from .observation_model import (
     apply_observation_model,
     area_downsample_chw,
@@ -74,6 +105,7 @@ __all__ = [
     "PoseFreeGaussianSR",
     "fit_posefree_gaussian_scene",
     "render_arbitrary_scale",
+    "clear_renderer_caches",
     "ProgressEventCallback",
     "append_progress_event_jsonl",
     "emit_progress_event",
@@ -86,8 +118,11 @@ __all__ = [
     "num_sh_bases",
     "sh_basis",
     "apply_view_dependent_rgb",
+    "aggregate_step_metrics",
     "apply_density_control",
     "build_density_debug_summary",
+    "CapacityAppendResult",
+    "compare_render_summary",
     "DensityEventCallback",
     "DensityControlResult",
     "DensityDebugEntry",
@@ -97,8 +132,13 @@ __all__ = [
     "append_density_event_jsonl",
     "emit_density_event",
     "compute_prune_keep_mask",
+    "compact_rows_in_place",
     "gradient_score",
     "normalize_render_stats",
+    "append_rows_in_place",
+    "available_capacity",
+    "resolve_capacity",
+    "select_compare_views",
     "scale_score",
     "select_split_indices",
     "select_clone_indices",
@@ -107,6 +147,13 @@ __all__ = [
     "DataContracts",
     "PreparedVisibility",
     "RasterConfig",
+    "prepare_visibility",
+    "render_projection_meta",
+    "render_visibility_meta",
+    "render_stats_prepared",
+    "render_values",
+    "render_stats",
+    "render_gaussians",
     "estimate_intersections",
     "estimate_tiles",
     "estimate_buffer_bytes_for_example",
@@ -119,6 +166,17 @@ __all__ = [
     "render_values_warp",
     "render_stats_warp",
     "render_gaussians_warp",
+    "helion_rasterize_values_op",
+    "prepare_visibility_helion",
+    "render_projection_meta_helion",
+    "render_visibility_meta_helion",
+    "render_stats_prepared_helion",
+    "render_values_helion",
+    "render_stats_helion",
+    "render_gaussians_helion",
+    "summarize_render_output",
+    "helion",
+    "hl",
     "wp",
     "require_warp",
     "_WARP_AVAILABLE",

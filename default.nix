@@ -7,7 +7,6 @@
   pythonOlder,
   pytest,
   warp-lang,
-  scikit-learn,
   setuptools,
   torch,
   torchvision,
@@ -31,16 +30,8 @@ buildPythonPackage (finalAttrs: {
   };
   build-system = [ setuptools ];
   dependencies = [
-    (warp-lang.override {
-      # Patch doesn't apply cleanly; it's fine, we only need the CUDA backend.
-      # https://github.com/NixOS/nixpkgs/blob/eac9adc9cc293c4cec9686f9ae534cf21a5f7c7e/pkgs/development/python-modules/warp-lang/default.nix#L24
-      standaloneSupport = false;
-    })
-    (helion.overridePythonAttrs (prevAttrs: {
-      dependencies = prevAttrs.dependencies ++ [
-        scikit-learn
-      ];
-    }))
+    warp-lang
+    helion
     hypothesis
     pytest
     torch

@@ -14,6 +14,8 @@ class CameraInit:
 
 @dataclass
 class RenderConfig:
+    backend: Literal["warp", "helion"] = "warp"
+    backward_impl: Literal["warp_tape", "reference", "hybrid", "helion"] = "hybrid"
     tile_size: int = 16
     eps2d: float = 0.30
     near: float = 1.0e-2
@@ -25,6 +27,8 @@ class RenderConfig:
     bbox_extent_sigma: float = 3.0
     antialiased_opacity: bool = True
     bg_color: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    helion_static_shapes: bool = True
+    helion_runtime_autotune: bool = True
 
 
 @dataclass
@@ -84,6 +88,9 @@ class DensityControlConfig:
     weak_view_split_topk: int = 0
     weak_view_clone_topk: int = 0
     weak_view_reseed_target_luma_min: float = -1.0
+    freeze_after_stable_events: int = 3
+    freeze_min_visible_fraction: float = 0.90
+    freeze_min_intersection_fraction: float = 0.95
     split_topk: int = 256
     clone_topk: int = 256
     split_scale_quantile: float = 0.7
@@ -97,6 +104,8 @@ class DensityControlConfig:
 class FieldConfig:
     anchor_stride: int = 1
     feature_dim: int = 8
+    gaussian_capacity: int = 65536
+    overflow_policy: Literal["freeze_density_and_warn", "abort"] = "freeze_density_and_warn"
     min_depth: float = 0.05
     init_depth: float = 1.0
     init_scale_xy: float = 0.75
@@ -112,6 +121,10 @@ class FieldConfig:
 class TrainConfig:
     stage_scales: tuple[float, ...] = (0.25, 0.5, 1.0)
     steps_per_stage: tuple[int, ...] = (500, 500, 1000)
+    final_stage_max_steps: int = 0
+    final_stage_early_stop_patience: int = 0
+    final_stage_early_stop_min_step: int = 0
+    final_stage_early_stop_loss_delta: float = 0.0
     lr_field: float = 1.0e-2
     lr_camera: float = 2.0e-3
     lr_residual: float = 1.0e-3
@@ -125,6 +138,8 @@ class TrainConfig:
     grad_clip: float = 1.0
     use_phasecorr_init: bool = True
     view_batch_size: int = 0
+    ordinary_step_view_batch: int = 2
+    final_stage_views_per_microbatch: int = 2
     print_every: int = 50
 
 

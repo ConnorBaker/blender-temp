@@ -318,6 +318,205 @@ def project_gaussians_kernel(
     depth_key[i] = int(wp.clamp(Z * depth_scale, 0.0, 2147483647.0))
 
 
+def specialize_project_kernel(
+    *,
+    tile_size: int,
+    near_plane: float,
+    far_plane: float,
+    eps2d: float,
+    radius_clip: float,
+    depth_scale: float,
+):
+    TILE_SIZE = wp.constant(int(tile_size))
+    NEAR_PLANE = wp.constant(float(near_plane))
+    FAR_PLANE = wp.constant(float(far_plane))
+    EPS2D = wp.constant(float(eps2d))
+    RADIUS_CLIP = wp.constant(float(radius_clip))
+    DEPTH_SCALE = wp.constant(float(depth_scale))
+
+    @wp.kernel(module="unique")
+    def project_gaussians_kernel_specialized(
+        means: wp.array(dtype=wp.vec3),
+        quat: wp.array(dtype=wp.vec4),
+        scale: wp.array(dtype=wp.vec3),
+        viewmat: wp.array2d(dtype=wp.float32),
+        K: wp.array2d(dtype=wp.float32),
+        width: int,
+        height: int,
+        tiles_x: int,
+        tiles_y: int,
+        xys: wp.array(dtype=wp.vec2),
+        conic: wp.array(dtype=wp.vec3),
+        rho: wp.array(dtype=wp.float32),
+        radius: wp.array(dtype=wp.int32),
+        num_tiles_hit: wp.array(dtype=wp.int32),
+        tile_min: wp.array(dtype=wp.vec2i),
+        tile_max: wp.array(dtype=wp.vec2i),
+        depth_key: wp.array(dtype=wp.int32),
+    ):
+        i = wp.tid()
+
+        fx = float(K[0, 0])
+        fy = float(K[1, 1])
+        cx = float(K[0, 2])
+        cy = float(K[1, 2])
+
+        r00 = float(viewmat[0, 0])
+        r01 = float(viewmat[0, 1])
+        r02 = float(viewmat[0, 2])
+        t0 = float(viewmat[0, 3])
+        r10 = float(viewmat[1, 0])
+        r11 = float(viewmat[1, 1])
+        r12 = float(viewmat[1, 2])
+        t1 = float(viewmat[1, 3])
+        r20 = float(viewmat[2, 0])
+        r21 = float(viewmat[2, 1])
+        r22 = float(viewmat[2, 2])
+        t2 = float(viewmat[2, 3])
+
+        mean = means[i]
+        Xw = mean[0]
+        Yw = mean[1]
+        Zw = mean[2]
+        X = r00 * Xw + r01 * Yw + r02 * Zw + t0
+        Y = r10 * Xw + r11 * Yw + r12 * Zw + t1
+        Z = r20 * Xw + r21 * Yw + r22 * Zw + t2
+
+        if (Z <= NEAR_PLANE) or (Z >= FAR_PLANE):
+            _write_culled_projection(
+                i,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0,
+                0,
+                xys,
+                conic,
+                rho,
+                radius,
+                num_tiles_hit,
+                tile_min,
+                tile_max,
+                depth_key,
+            )
+            return
+
+        invZ = 1.0 / Z
+        u = fx * X * invZ + cx
+        v = fy * Y * invZ + cy
+
+        q = quat[i]
+        qn = _quat_normalize(q[0], q[1], q[2], q[3])
+        c0, c1, c2 = _quat_to_rot_cols(qn)
+        t0v = _mat3_mul_vec3(r00, r01, r02, r10, r11, r12, r20, r21, r22, c0)
+        t1v = _mat3_mul_vec3(r00, r01, r02, r10, r11, r12, r20, r21, r22, c1)
+        t2v = _mat3_mul_vec3(r00, r01, r02, r10, r11, r12, r20, r21, r22, c2)
+
+        s = scale[i]
+        sx = wp.max(s[0], 1.0e-8)
+        sy = wp.max(s[1], 1.0e-8)
+        sz = wp.max(s[2], 1.0e-8)
+        s0 = sx * sx
+        s1 = sy * sy
+        s2 = sz * sz
+
+        o00, o01, o02, o11, o12, o22 = _outer_sym_entries(t0v)
+        p00, p01, p02, p11, p12, p22 = _outer_sym_entries(t1v)
+        q00, q01, q02, q11, q12, q22 = _outer_sym_entries(t2v)
+
+        c00 = s0 * o00 + s1 * p00 + s2 * q00
+        c01 = s0 * o01 + s1 * p01 + s2 * q01
+        c02 = s0 * o02 + s1 * p02 + s2 * q02
+        c11 = s0 * o11 + s1 * p11 + s2 * q11
+        c12 = s0 * o12 + s1 * p12 + s2 * q12
+        c22 = s0 * o22 + s1 * p22 + s2 * q22
+
+        s00, s01, s11 = _cov2d_from_cov3d_jacobian(c00, c01, c02, c11, c12, c22, fx, fy, X, Y, Z)
+        det_noeps = wp.max(s00 * s11 - s01 * s01, 1.0e-20)
+        s00e = s00 + EPS2D
+        s11e = s11 + EPS2D
+        s01e = s01
+        A, B, C, det_eps = _inv_sym2(s00e, s01e, s11e)
+        rho_i = wp.sqrt(det_noeps / det_eps)
+
+        lam = _lambda_max_sym2(s00e, s01e, s11e)
+        rad_f = 3.0 * wp.sqrt(wp.max(lam, 0.0))
+        rad_i = int(wp.ceil(rad_f))
+        depth_i = int(wp.clamp(Z * DEPTH_SCALE, 0.0, 2147483647.0))
+
+        if RADIUS_CLIP > 0.0 and float(rad_i) >= RADIUS_CLIP:
+            _write_culled_projection(
+                i,
+                u,
+                v,
+                A,
+                B,
+                C,
+                rho_i,
+                0,
+                depth_i,
+                xys,
+                conic,
+                rho,
+                radius,
+                num_tiles_hit,
+                tile_min,
+                tile_max,
+                depth_key,
+            )
+            return
+
+        if (
+            (u + float(rad_i) < 0.0)
+            or (u - float(rad_i) >= float(width))
+            or (v + float(rad_i) < 0.0)
+            or (v - float(rad_i) >= float(height))
+        ):
+            _write_culled_projection(
+                i,
+                u,
+                v,
+                A,
+                B,
+                C,
+                rho_i,
+                0,
+                depth_i,
+                xys,
+                conic,
+                rho,
+                radius,
+                num_tiles_hit,
+                tile_min,
+                tile_max,
+                depth_key,
+            )
+            return
+
+        x0 = int(wp.floor((u - float(rad_i)) / float(TILE_SIZE)))
+        x1 = int(wp.floor((u + float(rad_i)) / float(TILE_SIZE)))
+        y0 = int(wp.floor((v - float(rad_i)) / float(TILE_SIZE)))
+        y1 = int(wp.floor((v + float(rad_i)) / float(TILE_SIZE)))
+        x0 = wp.clamp(x0, 0, tiles_x - 1)
+        x1 = wp.clamp(x1, 0, tiles_x - 1)
+        y0 = wp.clamp(y0, 0, tiles_y - 1)
+        y1 = wp.clamp(y1, 0, tiles_y - 1)
+
+        xys[i] = wp.vec2(u, v)
+        conic[i] = wp.vec3(A, B, C)
+        rho[i] = rho_i
+        radius[i] = rad_i
+        tile_min[i] = wp.vec2i(x0, y0)
+        tile_max[i] = wp.vec2i(x1, y1)
+        num_tiles_hit[i] = (x1 - x0 + 1) * (y1 - y0 + 1)
+        depth_key[i] = depth_i
+
+    return project_gaussians_kernel_specialized
+
+
 @wp.kernel
 def map_to_intersects_kernel(
     num_tiles_hit: wp.array(dtype=wp.int32),
@@ -361,212 +560,187 @@ def init_int32_kernel(arr: wp.array(dtype=wp.int32), value: int):
     arr[i] = wp.int32(value)
 
 
-@wp.kernel
-def rasterize_values_kernel(
-    tile_start: wp.array(dtype=wp.int32),
-    tile_end: wp.array(dtype=wp.int32),
-    sorted_vals: wp.array(dtype=wp.int32),
-    xys: wp.array(dtype=wp.vec2),
-    conic: wp.array(dtype=wp.vec3),
-    rho: wp.array(dtype=wp.float32),
-    values: wp.array(dtype=wp.float32),
-    opacity: wp.array(dtype=wp.float32),
+def specialize_raster_kernels(
     channels: int,
-    width: int,
-    height: int,
-    tiles_x: int,
+    *,
     tile_size: int,
-    alpha_min: float,
-    trans_eps: float,
-    clamp_alpha_max: float,
-    antialiased: int,
-    background: wp.array(dtype=wp.float32),
-    out_values: wp.array(dtype=wp.float32),
+    antialiased: bool,
+    background_is_zero: bool,
 ):
-    p = wp.tid()
-    px = p - (p // width) * width
-    py = p // width
-    tile_x = px // tile_size
-    tile_y = py // tile_size
-    tile_id = tile_y * tiles_x + tile_x
-    start = tile_start[tile_id]
-    end = tile_end[tile_id]
-    fx = float(px) + 0.5
-    fy = float(py) + 0.5
-    base = p * channels
+    VecC = wp.types.vector(length=channels, dtype=wp.float32)
+    TILE_SIZE = wp.constant(int(tile_size))
 
-    T = float(1.0)
-    for c in range(channels):
-        out_values[base + c] = 0.0
+    @wp.kernel(module="unique")
+    def rasterize_values_kernel(
+        tile_start: wp.array(dtype=wp.int32),
+        tile_end: wp.array(dtype=wp.int32),
+        sorted_vals: wp.array(dtype=wp.int32),
+        xys: wp.array(dtype=wp.vec2),
+        conic: wp.array(dtype=wp.vec3),
+        rho: wp.array(dtype=wp.float32),
+        values: wp.array(dtype=VecC),
+        opacity: wp.array(dtype=wp.float32),
+        width: int,
+        height: int,
+        tiles_x: int,
+        alpha_min: float,
+        trans_eps: float,
+        clamp_alpha_max: float,
+        background: wp.array(dtype=wp.float32),
+        out_values: wp.array(dtype=VecC),
+        out_final_T: wp.array(dtype=wp.float32),
+        out_stop_idx: wp.array(dtype=wp.int32),
+    ):
+        p = wp.tid()
+        px = p - (p // width) * width
+        py = p // width
+        tile_x = px // TILE_SIZE
+        tile_y = py // TILE_SIZE
+        tile_id = tile_y * tiles_x + tile_x
+        start = tile_start[tile_id]
+        end = tile_end[tile_id]
+        fx = float(px) + 0.5
+        fy = float(py) + 0.5
 
-    if start < end:
+        bg = VecC(0.0)
+        if not wp.static(background_is_zero):
+            for c in range(wp.static(channels)):
+                bg[c] = background[c]
+
+        T = float(1.0)
+        stop = start
+        accum = VecC(0.0)
         for idx in range(start, end):
             gid = sorted_vals[idx]
             xy = xys[gid]
-            conic_abc = conic[gid]
             dx = fx - xy[0]
             dy = fy - xy[1]
-            A = conic_abc[0]
-            B = conic_abc[1]
-            C = conic_abc[2]
-            sigma = 0.5 * (A * dx * dx + C * dy * dy) + B * dx * dy
+            abc = conic[gid]
+            sigma = 0.5 * (abc[0] * dx * dx + abc[2] * dy * dy) + abc[1] * dx * dy
             w = wp.exp(-sigma)
             a = opacity[gid] * w
-            if antialiased != 0:
+            if wp.static(antialiased):
                 a *= rho[gid]
             if a > clamp_alpha_max:
                 a = clamp_alpha_max
             if a < alpha_min:
                 continue
             w_i = T * a
-            value_base = gid * channels
-            for c in range(channels):
-                out_values[base + c] += w_i * values[value_base + c]
+            accum = accum + w_i * values[gid]
             T *= 1.0 - a
+            stop = idx + 1
             if T < trans_eps:
                 break
 
-    for c in range(channels):
-        out_values[base + c] += T * background[c]
+        if not wp.static(background_is_zero):
+            accum = accum + T * bg
 
+        out_values[p] = accum
+        out_final_T[p] = T
+        out_stop_idx[p] = stop
 
-@wp.kernel
-def rasterize_values_backward_kernel(
-    tile_start: wp.array(dtype=wp.int32),
-    tile_end: wp.array(dtype=wp.int32),
-    sorted_vals: wp.array(dtype=wp.int32),
-    xys: wp.array(dtype=wp.vec2),
-    conic: wp.array(dtype=wp.vec3),
-    rho: wp.array(dtype=wp.float32),
-    values: wp.array(dtype=wp.float32),
-    opacity: wp.array(dtype=wp.float32),
-    channels: int,
-    width: int,
-    height: int,
-    tiles_x: int,
-    tile_size: int,
-    alpha_min: float,
-    trans_eps: float,
-    clamp_alpha_max: float,
-    antialiased: int,
-    background: wp.array(dtype=wp.float32),
-    grad_out: wp.array(dtype=wp.float32),
-    grad_xys: wp.array(dtype=wp.float32),
-    grad_conic: wp.array(dtype=wp.float32),
-    grad_rho: wp.array(dtype=wp.float32),
-    grad_values: wp.array(dtype=wp.float32),
-    grad_opacity: wp.array(dtype=wp.float32),
-):
-    p = wp.tid()
-    px = p - (p // width) * width
-    py = p // width
-    tile_x = px // tile_size
-    tile_y = py // tile_size
-    tile_id = tile_y * tiles_x + tile_x
-    start = tile_start[tile_id]
-    end = tile_end[tile_id]
-    fx = float(px) + 0.5
-    fy = float(py) + 0.5
-    base = p * channels
+    @wp.kernel(module="unique")
+    def rasterize_values_backward_kernel(
+        tile_start: wp.array(dtype=wp.int32),
+        tile_end: wp.array(dtype=wp.int32),
+        sorted_vals: wp.array(dtype=wp.int32),
+        xys: wp.array(dtype=wp.vec2),
+        conic: wp.array(dtype=wp.vec3),
+        rho: wp.array(dtype=wp.float32),
+        values: wp.array(dtype=VecC),
+        opacity: wp.array(dtype=wp.float32),
+        width: int,
+        height: int,
+        tiles_x: int,
+        alpha_min: float,
+        trans_eps: float,
+        clamp_alpha_max: float,
+        background: wp.array(dtype=wp.float32),
+        final_T: wp.array(dtype=wp.float32),
+        stop_idx: wp.array(dtype=wp.int32),
+        grad_out: wp.array(dtype=VecC),
+        grad_xys: wp.array(dtype=wp.vec2),
+        grad_conic: wp.array(dtype=wp.vec3),
+        grad_rho: wp.array(dtype=wp.float32),
+        grad_values: wp.array(dtype=VecC),
+        grad_opacity: wp.array(dtype=wp.float32),
+    ):
+        p = wp.tid()
+        px = p - (p // width) * width
+        py = p // width
+        tile_x = px // TILE_SIZE
+        tile_y = py // TILE_SIZE
+        p = py * width + px
+        grad_out_p = grad_out[p]
+        tile_id = tile_y * tiles_x + tile_x
+        start = tile_start[tile_id]
+        fx = float(px) + 0.5
+        fy = float(py) + 0.5
 
-    stop = end
-    final_T = float(1.0)
-    if start < end:
-        for idx in range(start, end):
+        bg = VecC(0.0)
+        if not wp.static(background_is_zero):
+            for c in range(wp.static(channels)):
+                bg[c] = background[c]
+
+        stop = stop_idx[p]
+        final_T_p = final_T[p]
+        suffix_dot = float(0.0)
+        if not wp.static(background_is_zero):
+            suffix_dot = wp.dot(grad_out_p, bg)
+
+        suffix_trans = float(1.0)
+        for rev in range(stop - start):
+            idx = stop - 1 - rev
             gid = sorted_vals[idx]
             xy = xys[gid]
-            conic_abc = conic[gid]
             dx = fx - xy[0]
             dy = fy - xy[1]
-            A = conic_abc[0]
-            B = conic_abc[1]
-            C = conic_abc[2]
-            sigma = 0.5 * (A * dx * dx + C * dy * dy) + B * dx * dy
-            weight = wp.exp(-sigma)
+            abc = conic[gid]
+            weight = wp.exp(-(0.5 * (abc[0] * dx * dx + abc[2] * dy * dy) + abc[1] * dx * dy))
             alpha_base = opacity[gid] * weight
-            alpha = alpha_base
-            if antialiased != 0:
-                alpha = alpha * rho[gid]
+            alpha_unclamped = alpha_base
+            if wp.static(antialiased):
+                alpha_unclamped *= rho[gid]
+            alpha = alpha_unclamped
+            clamped = 0
             if alpha > clamp_alpha_max:
                 alpha = clamp_alpha_max
+                clamped = 1
             if alpha < alpha_min:
                 continue
-            final_T *= 1.0 - alpha
-            if final_T < trans_eps:
-                stop = idx + 1
-                break
 
-    suffix_dot = float(0.0)
-    for c in range(channels):
-        suffix_dot += grad_out[base + c] * background[c]
+            denom = (1.0 - alpha) * suffix_trans
+            if denom < 1.0e-12:
+                denom = 1.0e-12
+            T_i = final_T_p / denom
+            weight_i = T_i * alpha
+            value_vec = values[gid]
+            wp.atomic_add(grad_values, gid, grad_out_p * weight_i)
 
-    suffix_trans = float(1.0)
-    count = stop - start
-    for rev in range(count):
-        idx = stop - 1 - rev
-        gid = sorted_vals[idx]
-        xy = xys[gid]
-        conic_abc = conic[gid]
-        dx = fx - xy[0]
-        dy = fy - xy[1]
-        A = conic_abc[0]
-        B = conic_abc[1]
-        C = conic_abc[2]
-        sigma = 0.5 * (A * dx * dx + C * dy * dy) + B * dx * dy
-        weight = wp.exp(-sigma)
-        alpha_base = opacity[gid] * weight
-        alpha_unclamped = alpha_base
-        if antialiased != 0:
-            alpha_unclamped = alpha_unclamped * rho[gid]
-        alpha = alpha_unclamped
-        clamped = 0
-        if alpha > clamp_alpha_max:
-            alpha = clamp_alpha_max
-            clamped = 1
-        if alpha < alpha_min:
-            continue
+            dot_grad_value = wp.dot(grad_out_p, value_vec)
+            dL_dalpha = T_i * (dot_grad_value - suffix_dot)
+            if clamped == 0:
+                dL_dalpha_base = dL_dalpha
+                if wp.static(antialiased):
+                    wp.atomic_add(grad_rho, gid, dL_dalpha * alpha_base)
+                    dL_dalpha_base *= rho[gid]
 
-        denom = (1.0 - alpha) * suffix_trans
-        if denom < 1.0e-12:
-            denom = 1.0e-12
-        T_i = final_T / denom
-        weight_i = T_i * alpha
+                wp.atomic_add(grad_opacity, gid, dL_dalpha_base * weight)
 
-        value_base = gid * channels
-        dot_grad_value = float(0.0)
-        for c in range(channels):
-            g = grad_out[base + c]
-            v = values[value_base + c]
-            dot_grad_value += g * v
-            wp.atomic_add(grad_values, value_base + c, g * weight_i)
+                dL_dsigma = -dL_dalpha_base * alpha_base
+                dL_dx = -dL_dsigma * (abc[0] * dx + abc[1] * dy)
+                dL_dy = -dL_dsigma * (abc[2] * dy + abc[1] * dx)
+                dL_dA = dL_dsigma * 0.5 * dx * dx
+                dL_dB = dL_dsigma * dx * dy
+                dL_dC = dL_dsigma * 0.5 * dy * dy
 
-        dL_dalpha = T_i * (dot_grad_value - suffix_dot)
-        if clamped == 0:
-            dL_dalpha_base = dL_dalpha
-            if antialiased != 0:
-                wp.atomic_add(grad_rho, gid, dL_dalpha * alpha_base)
-                dL_dalpha_base = dL_dalpha_base * rho[gid]
+                wp.atomic_add(grad_xys, gid, wp.vec2(dL_dx, dL_dy))
+                wp.atomic_add(grad_conic, gid, wp.vec3(dL_dA, dL_dB, dL_dC))
 
-            wp.atomic_add(grad_opacity, gid, dL_dalpha_base * weight)
+            suffix_dot = alpha * dot_grad_value + (1.0 - alpha) * suffix_dot
+            suffix_trans *= 1.0 - alpha
 
-            dL_dsigma = -dL_dalpha_base * alpha_base
-            dL_dx = -dL_dsigma * (A * dx + B * dy)
-            dL_dy = -dL_dsigma * (C * dy + B * dx)
-            dL_dA = dL_dsigma * 0.5 * dx * dx
-            dL_dB = dL_dsigma * dx * dy
-            dL_dC = dL_dsigma * 0.5 * dy * dy
-
-            grad_xys_base = gid * 2
-            wp.atomic_add(grad_xys, grad_xys_base, dL_dx)
-            wp.atomic_add(grad_xys, grad_xys_base + 1, dL_dy)
-
-            grad_conic_base = gid * 3
-            wp.atomic_add(grad_conic, grad_conic_base, dL_dA)
-            wp.atomic_add(grad_conic, grad_conic_base + 1, dL_dB)
-            wp.atomic_add(grad_conic, grad_conic_base + 2, dL_dC)
-
-        suffix_dot = alpha * dot_grad_value + (1.0 - alpha) * suffix_dot
-        suffix_trans *= 1.0 - alpha
+    return rasterize_values_kernel, rasterize_values_backward_kernel, VecC
 
 
 @wp.kernel
@@ -641,6 +815,87 @@ def rasterize_visibility_stats_kernel(
                 break
 
 
+def specialize_visibility_stats_kernel(
+    *,
+    antialiased: bool,
+    error_bins_x: int,
+    error_bins_y: int,
+):
+    ERROR_BINS_X = wp.constant(int(error_bins_x))
+    ERROR_BINS_Y = wp.constant(int(error_bins_y))
+    ERROR_BIN_COUNT = wp.constant(int(error_bins_x) * int(error_bins_y))
+
+    @wp.kernel(module="unique")
+    def rasterize_visibility_stats_kernel_specialized(
+        tile_start: wp.array(dtype=wp.int32),
+        tile_end: wp.array(dtype=wp.int32),
+        sorted_vals: wp.array(dtype=wp.int32),
+        xys: wp.array(dtype=wp.vec2),
+        conic: wp.array(dtype=wp.vec3),
+        rho: wp.array(dtype=wp.float32),
+        opacity: wp.array(dtype=wp.float32),
+        width: int,
+        height: int,
+        tiles_x: int,
+        tile_size: int,
+        residual_map: wp.array(dtype=wp.float32),
+        alpha_min: float,
+        trans_eps: float,
+        clamp_alpha_max: float,
+        out_contrib: wp.array(dtype=wp.float32),
+        out_trans: wp.array(dtype=wp.float32),
+        out_hits: wp.array(dtype=wp.float32),
+        out_residual: wp.array(dtype=wp.float32),
+        out_error_map: wp.array(dtype=wp.float32),
+    ):
+        p = wp.tid()
+        px = p - (p // width) * width
+        py = p // width
+        tile_x = px // tile_size
+        tile_y = py // tile_size
+        tile_id = tile_y * tiles_x + tile_x
+        start = tile_start[tile_id]
+        end = tile_end[tile_id]
+        fx = float(px) + 0.5
+        fy = float(py) + 0.5
+
+        T = float(1.0)
+        if start < end:
+            for idx in range(start, end):
+                gid = sorted_vals[idx]
+                xy = xys[gid]
+                conic_abc = conic[gid]
+                dx = fx - xy[0]
+                dy = fy - xy[1]
+                A = conic_abc[0]
+                B = conic_abc[1]
+                C = conic_abc[2]
+                sigma = 0.5 * (A * dx * dx + C * dy * dy) + B * dx * dy
+                w = wp.exp(-sigma)
+                a = opacity[gid] * w
+                if wp.static(antialiased):
+                    a *= rho[gid]
+                if a > clamp_alpha_max:
+                    a = clamp_alpha_max
+                if a < alpha_min:
+                    continue
+                w_i = T * a
+                residual = residual_map[p]
+                wp.atomic_add(out_contrib, gid, w_i)
+                wp.atomic_add(out_trans, gid, T)
+                wp.atomic_add(out_hits, gid, 1.0)
+                wp.atomic_add(out_residual, gid, w_i * residual)
+                bx = int(wp.clamp((float(px) / float(width)) * float(ERROR_BINS_X), 0.0, float(ERROR_BINS_X - 1)))
+                by = int(wp.clamp((float(py) / float(height)) * float(ERROR_BINS_Y), 0.0, float(ERROR_BINS_Y - 1)))
+                bin_idx = by * ERROR_BINS_X + bx
+                wp.atomic_add(out_error_map, gid * ERROR_BIN_COUNT + bin_idx, w_i * residual)
+                T *= 1.0 - a
+                if T < trans_eps:
+                    break
+
+    return rasterize_visibility_stats_kernel_specialized
+
+
 @wp.kernel
 def get_tile_bin_edges_kernel(
     sorted_keys: wp.array(dtype=wp.int64),
@@ -665,10 +920,11 @@ def get_tile_bin_edges_kernel(
 
 __all__ = [
     "project_gaussians_kernel",
+    "specialize_project_kernel",
     "map_to_intersects_kernel",
     "init_int32_kernel",
     "get_tile_bin_edges_kernel",
-    "rasterize_values_kernel",
-    "rasterize_values_backward_kernel",
+    "specialize_raster_kernels",
     "rasterize_visibility_stats_kernel",
+    "specialize_visibility_stats_kernel",
 ]

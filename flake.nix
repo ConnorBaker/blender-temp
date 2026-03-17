@@ -28,6 +28,8 @@
         inputs.git-hooks-nix.flakeModule
       ];
 
+      flake.overlays.default = import ./overlay.nix;
+
       perSystem =
         {
           config,
@@ -43,17 +45,18 @@
               cudaSupport = true;
               cudaCapabilities = [ "8.9" ];
             };
+            overlays = [ inputs.self.overlays.default ];
           };
 
           legacyPackages = pkgs;
 
           packages = {
-            blender-render = pkgs.callPackage ./blender-render { };
-            blender-temp = pkgs.python3.pkgs.callPackage ./default.nix { };
-          };
+            inherit (pkgs)
+              blender-render
+              blender-temp
+              ;
 
-          devShells.default = pkgs.mkShell {
-            packages = [ config.packages.blender-render ];
+            default = config.packages.blender-temp;
           };
 
           pre-commit.settings.hooks = {

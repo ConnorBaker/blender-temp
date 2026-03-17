@@ -129,6 +129,7 @@ def test_select_clone_indices_respects_exclude_and_capacity() -> None:
         avg_trans=torch.tensor([1.0, 1.0, 1.0, 1.0], dtype=torch.float32),
         avg_contrib=torch.ones(4, dtype=torch.float32),
         residual=torch.tensor([0.0, 0.0, 0.0, 0.0], dtype=torch.float32),
+        avg_residual=torch.tensor([0.0, 0.0, 0.0, 0.0], dtype=torch.float32),
         error_map=torch.zeros(4, 1, dtype=torch.float32),
         peak_error=torch.tensor([0.0, 0.0, 0.0, 0.0], dtype=torch.float32),
     )
@@ -154,6 +155,7 @@ def test_build_density_debug_summary_reports_peak_bins() -> None:
         avg_trans=torch.tensor([0.2, 0.3], dtype=torch.float32),
         avg_contrib=torch.tensor([2.0, 4.0], dtype=torch.float32),
         residual=torch.tensor([0.5, 1.0], dtype=torch.float32),
+        avg_residual=torch.tensor([0.25, 0.25], dtype=torch.float32),
         error_map=torch.tensor([[0.1, 0.9], [0.2, 0.3]], dtype=torch.float32),
         peak_error=torch.tensor([0.9, 0.3], dtype=torch.float32),
     )
@@ -163,7 +165,7 @@ def test_build_density_debug_summary_reports_peak_bins() -> None:
     clone_score = torch.tensor([0.2, 0.4], dtype=torch.float32)
 
     summary = build_density_debug_summary(
-        opacity, grad, scale, stats, split_idx, clone_idx, split_score, clone_score, cfg
+        opacity, grad, scale, stats, None, split_idx, clone_idx, split_score, clone_score, cfg
     )
 
     assert summary.screen_error_bins == 2
@@ -210,8 +212,9 @@ def test_reseed_view_indices_triggers_before_weak_view_floor() -> None:
 def test_apply_density_control_can_clone_with_real_field(anchor_rgb: torch.Tensor) -> None:
     field = _make_test_field(anchor_rgb, stride=2, feature_dim=2)
     n = field.num_gaussians
-    field.depth_raw.grad = torch.ones_like(field.depth_raw)
-    field.xyz_offset.grad = torch.zeros_like(field.xyz_offset)
+    field.means3d.grad = torch.ones_like(field.means3d)
+    field.log_scale.grad = torch.zeros_like(field.log_scale)
+    field.opacity_logit.grad = torch.zeros_like(field.opacity_logit)
 
     cfg = DensityControlConfig(
         enabled=True,

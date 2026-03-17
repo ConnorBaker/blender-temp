@@ -19,10 +19,9 @@ from .warp_gsplat_contracts import (
 from .warp_gsplat_kernels import (
     get_tile_bin_edges_kernel,
     map_to_intersects_kernel,
-    project_gaussians_kernel,
-    rasterize_values_backward_kernel,
-    rasterize_values_kernel,
-    rasterize_visibility_stats_kernel,
+    specialize_project_kernel,
+    specialize_raster_kernels,
+    specialize_visibility_stats_kernel,
 )
 from .warp_runtime import require_warp, wp
 
@@ -269,9 +268,30 @@ except ImportError:
         return out
 
 
-_WARP_BLOCK_DIM = 256
 _LOADED_KERNEL_MODULES: set[tuple[str, int]] = set()
 _SCRATCH_TENSOR_CACHE: dict[tuple[str, tuple[int, ...], str, int | None, str], Tensor] = {}
+
+
+def _warp_block_dim() -> int:
+    raw = os.environ.get("BLENDER_TEMP_WARP_BLOCK_DIM", "608").strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid BLENDER_TEMP_WARP_BLOCK_DIM={raw!r}") from exc
+    if value <= 0:
+        raise ValueError(f"BLENDER_TEMP_WARP_BLOCK_DIM must be > 0, got {value}")
+    return value
+
+
+def _warp_project_block_dim() -> int:
+    raw = os.environ.get("BLENDER_TEMP_WARP_PROJECT_BLOCK_DIM", "256").strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid BLENDER_TEMP_WARP_PROJECT_BLOCK_DIM={raw!r}") from exc
+    if value <= 0:
+        raise ValueError(f"BLENDER_TEMP_WARP_PROJECT_BLOCK_DIM must be > 0, got {value}")
+    return value
 
 
 @dataclass(frozen=True)
@@ -289,6 +309,8 @@ class PreparedVisibility:
     tiles_x: int
     tiles_y: int
     tile_count: int
+    gaussian_count_value: int | None = None
+    intersection_count_value: int | None = None
 
     @property
     def device(self) -> torch.device:
@@ -296,10 +318,22 @@ class PreparedVisibility:
 
     @property
     def gaussian_count(self) -> int:
+        if self.gaussian_count_value is not None:
+            return int(self.gaussian_count_value)
         return int(self.xys.shape[0])
 
     @property
     def intersection_count(self) -> int:
+        if self.intersection_count_value is not None:
+            return int(self.intersection_count_value)
+        return int(self.sorted_vals.shape[0])
+
+    @property
+    def gaussian_capacity(self) -> int:
+        return int(self.xys.shape[0])
+
+    @property
+    def intersection_capacity(self) -> int:
         return int(self.sorted_vals.shape[0])
 
     def meta(self) -> dict[str, Tensor]:
@@ -349,7 +383,7 @@ class _KernelLaunchCache:
             outputs=recordable_outputs,
             device=device,
             stream=stream,
-            block_dim=_WARP_BLOCK_DIM,
+            block_dim=_warp_block_dim(),
         )
 
 
@@ -380,9 +414,10 @@ def _ensure_warp_ready(device: torch.device) -> str:
                 wp.set_mempool_enabled(device_str, False)
         except Exception:
             pass
-    key = (device_str, _WARP_BLOCK_DIM)
+    block_dim = _warp_block_dim()
+    key = (device_str, block_dim)
     if key not in _LOADED_KERNEL_MODULES:
-        wp.load_module(module=warp_gsplat_kernel_module, device=device_str, block_dim=_WARP_BLOCK_DIM)
+        wp.load_module(module=warp_gsplat_kernel_module, device=device_str, block_dim=block_dim)
         _LOADED_KERNEL_MODULES.add(key)
     return device_str
 
@@ -414,6 +449,21 @@ def _torch_sort_pairs(keys: Tensor, vals: Tensor) -> tuple[Tensor, Tensor]:
 def _sort_buffer_bytes(M: int, *, use_warp_radix: bool) -> int:
     length = (2 * M) if use_warp_radix else M
     return length * 8 + length * 4
+
+
+def _select_sort_mode_and_bytes(
+    M: int,
+    cfg: RasterConfig,
+) -> tuple[bool, str, int, int, int]:
+    use_warp_radix = cfg.sort_mode in ("auto", "warp_radix")
+    warp_sort_bytes = _sort_buffer_bytes(M, use_warp_radix=True)
+    torch_sort_bytes = _sort_buffer_bytes(M, use_warp_radix=False)
+    budget = cfg.max_sort_buffer_bytes
+    if budget is not None and use_warp_radix and warp_sort_bytes > budget and cfg.sort_mode == "auto":
+        use_warp_radix = False
+    chosen_mode = "warp_radix" if use_warp_radix else "torch_sort"
+    chosen_bytes = warp_sort_bytes if use_warp_radix else torch_sort_bytes
+    return use_warp_radix, chosen_mode, chosen_bytes, warp_sort_bytes, torch_sort_bytes
 
 
 def _validate_vec_input(t: Tensor, name: str, width: int) -> int:
@@ -531,6 +581,14 @@ def _allocate_visibility_state(
 
 
 def _launch_project(state: dict[str, object], cfg: RasterConfig, *, stream) -> None:
+    project_kernel = specialize_project_kernel(
+        tile_size=int(state["tile_size"]),
+        near_plane=float(cfg.near_plane),
+        far_plane=float(cfg.far_plane),
+        eps2d=float(cfg.eps2d),
+        radius_clip=float(cfg.radius_clip),
+        depth_scale=float(cfg.depth_scale),
+    )
     inputs = [
         state["means_wp"],
         state["quat_wp"],
@@ -539,14 +597,8 @@ def _launch_project(state: dict[str, object], cfg: RasterConfig, *, stream) -> N
         state["K_wp"],
         int(state["width"]),
         int(state["height"]),
-        int(state["tile_size"]),
         int(state["tiles_x"]),
         int(state["tiles_y"]),
-        float(cfg.near_plane),
-        float(cfg.far_plane),
-        float(cfg.eps2d),
-        float(cfg.radius_clip),
-        float(cfg.depth_scale),
     ]
     outputs = [
         state["xys_wp"],
@@ -558,50 +610,15 @@ def _launch_project(state: dict[str, object], cfg: RasterConfig, *, stream) -> N
         state["tile_max_wp"],
         state["depth_key_wp"],
     ]
-    if bool(state["requires_grad"]):
-        wp.launch(
-            project_gaussians_kernel,
-            dim=int(state["gaussian_count"]),
-            inputs=inputs,
-            outputs=outputs,
-            device=str(state["device_str"]),
-            stream=stream,
-            block_dim=_WARP_BLOCK_DIM,
-        )
-    else:
-        _LAUNCH_CACHE.launch(
-            project_gaussians_kernel,
-            dim=int(state["gaussian_count"]),
-            inputs=[
-                state["means_t"],
-                state["quat_t"],
-                state["scale_t"],
-                state["viewmat_t"],
-                state["K_t"],
-                int(state["width"]),
-                int(state["height"]),
-                int(state["tile_size"]),
-                int(state["tiles_x"]),
-                int(state["tiles_y"]),
-                float(cfg.near_plane),
-                float(cfg.far_plane),
-                float(cfg.eps2d),
-                float(cfg.radius_clip),
-                float(cfg.depth_scale),
-            ],
-            outputs=[
-                state["xys_t"],
-                state["conic_t"],
-                state["rho_t"],
-                state["radius_t"],
-                state["num_tiles_hit_t"],
-                state["tile_min_t"],
-                state["tile_max_t"],
-                state["depth_key_t"],
-            ],
-            device=str(state["device_str"]),
-            stream=stream,
-        )
+    wp.launch(
+        project_kernel,
+        dim=int(state["gaussian_count"]),
+        inputs=inputs,
+        outputs=outputs,
+        device=str(state["device_str"]),
+        stream=stream,
+        block_dim=_warp_project_block_dim(),
+    )
 
 
 def _prepare_sorted_intersections(
@@ -638,24 +655,22 @@ def _prepare_sorted_intersections(
         state["sorted_vals_wp"] = None
         return prepared
 
-    use_warp_radix = cfg.sort_mode in ("auto", "warp_radix")
-    warp_sort_bytes = _sort_buffer_bytes(M, use_warp_radix=True)
-    torch_sort_bytes = _sort_buffer_bytes(M, use_warp_radix=False)
+    use_warp_radix, chosen_mode, chosen_bytes, _warp_sort_bytes, _torch_sort_bytes = _select_sort_mode_and_bytes(M, cfg)
     budget = cfg.max_sort_buffer_bytes
     if budget is not None:
-        if use_warp_radix and warp_sort_bytes > budget and cfg.sort_mode == "auto":
-            use_warp_radix = False
-        chosen_bytes = warp_sort_bytes if use_warp_radix else torch_sort_bytes
         if chosen_bytes > budget:
             gib = float(chosen_bytes) / float(1024**3)
             budget_gib = float(budget) / float(1024**3)
             raise RuntimeError(
                 "Projected intersection sort buffer exceeds configured budget: "
-                f"M={M}, sort_mode={'warp_radix' if use_warp_radix else 'torch_sort'}, "
+                f"M={M}, sort_mode={chosen_mode}, "
                 f"estimated_sort_bytes={chosen_bytes} ({gib:.2f} GiB), "
                 f"budget={budget} ({budget_gib:.2f} GiB). "
-                "Reduce projected footprints with radius_clip_px, increase anchor_stride, "
-                "use fewer views per step, or disable final-stage density control."
+                "Recommended fixes, in order: "
+                "1) lower projected footprint with `radius_clip_px`; "
+                "2) reduce initial or learned scale growth; "
+                "3) freeze or prune before the next stage or after density growth; "
+                "4) only then increase `anchor_stride`."
             )
 
     pair_len = 2 * M if use_warp_radix else M
@@ -757,6 +772,7 @@ class WarpGSplatRasterizeValues(torch.autograd.Function):
         height: int,
         cfg: RasterConfig,
         return_prepared: bool,
+        background_is_zero: bool,
     ):
         N = _validate_render_inputs(means, quat, scale, opacity, viewmat, K)
         _assert_cuda_float32_contiguous(values, "values")
@@ -768,12 +784,15 @@ class WarpGSplatRasterizeValues(torch.autograd.Function):
 
         use_reference_backward = cfg.backward_impl == "reference"
         use_hybrid_backward = cfg.backward_impl == "hybrid"
+        needs_projection_grads = any(t.requires_grad for t in (means, quat, scale, viewmat, K))
+        requires_projection_tape = use_hybrid_backward and needs_projection_grads
         requires_tape = (
             (not use_reference_backward)
             and (not use_hybrid_backward)
             and cfg.record_projection_and_rasterize_on_tape
             and any(t.requires_grad for t in (means, quat, scale, values, opacity, viewmat, K))
         )
+        state_requires_grad = requires_tape or requires_projection_tape
         state = _allocate_visibility_state(
             means,
             quat,
@@ -783,22 +802,37 @@ class WarpGSplatRasterizeValues(torch.autograd.Function):
             int(width),
             int(height),
             cfg,
-            requires_grad=requires_tape,
-            reuse_scratch=not requires_tape and not return_prepared,
+            requires_grad=state_requires_grad,
+            reuse_scratch=not state_requires_grad and not return_prepared,
         )
         device = means.device
         stream = _warp_stream(device)
         channels = int(values.shape[1])
-        out_values_t = torch.zeros(height * width * channels, device=device, dtype=torch.float32)
-        out_values_wp = _wrap_output_tensor(out_values_t, wp.float32, requires_grad=requires_tape)
-        wp_values = _wrap_input_tensor(values.view(-1), wp.float32, requires_grad=requires_tape)
+        antialiased = cfg.rasterize_mode == "antialiased"
+        rasterize_values_kernel, rasterize_values_backward_kernel, value_vec_dtype = specialize_raster_kernels(
+            channels,
+            tile_size=int(state["tile_size"]),
+            antialiased=antialiased,
+            background_is_zero=background_is_zero,
+        )
+        out_values_t = torch.zeros((height * width, channels), device=device, dtype=torch.float32)
+        final_T_t = torch.empty(height * width, device=device, dtype=torch.float32)
+        stop_idx_t = torch.empty(height * width, device=device, dtype=torch.int32)
+        out_values_wp = _wrap_output_tensor(out_values_t, value_vec_dtype, requires_grad=requires_tape)
+        final_T_wp = _wrap_output_tensor(final_T_t, wp.float32, requires_grad=False)
+        stop_idx_wp = _wrap_output_tensor(stop_idx_t, wp.int32, requires_grad=False)
+        wp_values = _wrap_input_tensor(values, value_vec_dtype, requires_grad=requires_tape)
         wp_opacity = _wrap_input_tensor(opacity, wp.float32, requires_grad=requires_tape)
         wp_background = _wrap_input_tensor(background.view(-1), wp.float32, requires_grad=False)
 
         tape = wp.Tape() if requires_tape else None
+        projection_tape = wp.Tape() if requires_projection_tape else None
         with wp.ScopedStream(stream, sync_enter=False, sync_exit=False):
             if tape is not None:
                 with tape:
+                    _launch_project(state, cfg, stream=stream)
+            elif projection_tape is not None:
+                with projection_tape:
                     _launch_project(state, cfg, stream=stream)
             else:
                 _launch_project(state, cfg, stream=stream)
@@ -830,7 +864,9 @@ class WarpGSplatRasterizeValues(torch.autograd.Function):
             )
 
             if prepared.intersection_count <= 0:
-                out_t = out_values_t.view(height, width, channels) + background.view(1, 1, channels)
+                out_t = out_values_t.view(height, width, channels)
+                if not background_is_zero:
+                    out_t = out_t + background.view(1, 1, channels)
                 ctx.tape = None
                 ctx.saved = None
                 if not return_prepared:
@@ -847,7 +883,6 @@ class WarpGSplatRasterizeValues(torch.autograd.Function):
                 ctx.mark_non_differentiable(*aux_outputs)
                 return (out_t, *aux_outputs)
 
-            antialiased = 1 if cfg.rasterize_mode == "antialiased" else 0
             raster_inputs = [
                 state["tile_start_wp"],
                 state["tile_end_wp"],
@@ -857,40 +892,38 @@ class WarpGSplatRasterizeValues(torch.autograd.Function):
                 state["rho_wp"],
                 wp_values,
                 wp_opacity,
-                channels,
                 int(width),
                 int(height),
                 int(state["tiles_x"]),
-                int(state["tile_size"]),
                 float(cfg.alpha_min),
                 float(cfg.transmittance_eps),
                 float(cfg.clamp_alpha_max),
-                int(antialiased),
                 wp_background,
             ]
             if tape is not None:
                 with tape:
                     wp.launch(
                         rasterize_values_kernel,
-                        dim=height * width,
+                        dim=int(height) * int(width),
                         inputs=raster_inputs,
-                        outputs=[out_values_wp],
+                        outputs=[out_values_wp, final_T_wp, stop_idx_wp],
                         device=str(state["device_str"]),
                         stream=stream,
-                        block_dim=_WARP_BLOCK_DIM,
+                        block_dim=_warp_block_dim(),
                     )
             else:
                 wp.launch(
                     rasterize_values_kernel,
-                    dim=height * width,
+                    dim=int(height) * int(width),
                     inputs=raster_inputs,
-                    outputs=[out_values_wp],
+                    outputs=[out_values_wp, final_T_wp, stop_idx_wp],
                     device=str(state["device_str"]),
                     stream=stream,
-                    block_dim=_WARP_BLOCK_DIM,
+                    block_dim=_warp_block_dim(),
                 )
 
         ctx.tape = tape
+        ctx.projection_tape = projection_tape
         ctx.saved = (
             state["means_wp"],
             state["quat_wp"],
@@ -906,6 +939,9 @@ class WarpGSplatRasterizeValues(torch.autograd.Function):
             state["tile_end_wp"],
             state["sorted_vals_wp"],
             out_values_wp,
+            final_T_wp,
+            stop_idx_wp,
+            background_is_zero,
         )
         ctx.value_shape = tuple(values.shape)
         out_t = out_values_t.view(height, width, channels)
@@ -927,7 +963,7 @@ class WarpGSplatRasterizeValues(torch.autograd.Function):
     def backward(ctx, grad_out: Tensor, *_grad_aux):  # type: ignore[override]
         if getattr(ctx, "backward_impl", "warp_tape") == "reference":
             if grad_out is None:
-                return (None,) * 12
+                return (None,) * 13
             if not grad_out.is_contiguous():
                 grad_out = grad_out.contiguous()
 
@@ -1015,13 +1051,14 @@ class WarpGSplatRasterizeValues(torch.autograd.Function):
                 None,
                 None,
                 None,
+                None,
             )
 
         if getattr(ctx, "backward_impl", "warp_tape") == "hybrid":
             if ctx.saved is None:
-                return (None,) * 12
+                return (None,) * 13
             if grad_out is None:
-                return (None,) * 12
+                return (None,) * 13
             if not grad_out.is_contiguous():
                 grad_out = grad_out.contiguous()
 
@@ -1040,6 +1077,9 @@ class WarpGSplatRasterizeValues(torch.autograd.Function):
                 tile_end_wp,
                 sorted_vals_wp,
                 _out_values,
+                final_T_wp,
+                stop_idx_wp,
+                background_is_zero,
             ) = ctx.saved
 
             (
@@ -1063,13 +1103,20 @@ class WarpGSplatRasterizeValues(torch.autograd.Function):
             ) = ctx.reference_requires_grad
 
             channels = int(ctx.value_shape[1])
+            antialiased = ctx.cfg.rasterize_mode == "antialiased"
+            _, rasterize_values_backward_kernel, value_vec_dtype = specialize_raster_kernels(
+                channels,
+                tile_size=int(ctx.cfg.tile_size),
+                antialiased=antialiased,
+                background_is_zero=background_is_zero,
+            )
             gaussian_count = int(values_src.shape[0])
             device = grad_out.device
-            grad_out_flat = grad_out.reshape(-1).contiguous()
+            grad_out_vec_t = grad_out.reshape(-1, channels).contiguous()
             grad_xys_t = torch.zeros((gaussian_count, 2), device=device, dtype=torch.float32)
             grad_conic_t = torch.zeros((gaussian_count, 3), device=device, dtype=torch.float32)
             grad_rho_t = torch.zeros((gaussian_count,), device=device, dtype=torch.float32)
-            grad_values_t = torch.zeros((gaussian_count * channels,), device=device, dtype=torch.float32)
+            grad_values_t = torch.zeros((gaussian_count, channels), device=device, dtype=torch.float32)
             grad_opacity_t = torch.zeros((gaussian_count,), device=device, dtype=torch.float32)
 
             stream = _warp_stream(device)
@@ -1086,28 +1133,27 @@ class WarpGSplatRasterizeValues(torch.autograd.Function):
                         rho_wp,
                         wp_values,
                         wp_opacity,
-                        channels,
                         int(ctx.width),
                         int(ctx.height),
                         int((int(ctx.width) + int(ctx.cfg.tile_size) - 1) // int(ctx.cfg.tile_size)),
-                        int(ctx.cfg.tile_size),
                         float(ctx.cfg.alpha_min),
                         float(ctx.cfg.transmittance_eps),
                         float(ctx.cfg.clamp_alpha_max),
-                        int(1 if ctx.cfg.rasterize_mode == "antialiased" else 0),
                         _wrap_input_tensor(background_src.view(-1).contiguous(), wp.float32, requires_grad=False),
-                        _wrap_input_tensor(grad_out_flat, wp.float32, requires_grad=False),
+                        final_T_wp,
+                        stop_idx_wp,
+                        _wrap_input_tensor(grad_out_vec_t, value_vec_dtype, requires_grad=False),
                     ],
                     outputs=[
-                        _wrap_output_tensor(grad_xys_t.view(-1), wp.float32),
-                        _wrap_output_tensor(grad_conic_t.view(-1), wp.float32),
+                        _wrap_output_tensor(grad_xys_t, wp.vec2f),
+                        _wrap_output_tensor(grad_conic_t, wp.vec3f),
                         _wrap_output_tensor(grad_rho_t, wp.float32),
-                        _wrap_output_tensor(grad_values_t, wp.float32),
+                        _wrap_output_tensor(grad_values_t, value_vec_dtype),
                         _wrap_output_tensor(grad_opacity_t, wp.float32),
                     ],
                     device=str(device),
                     stream=stream,
-                    block_dim=_WARP_BLOCK_DIM,
+                    block_dim=_warp_block_dim(),
                 )
 
             values_grad = grad_values_t.view(ctx.value_shape) if values_req else None
@@ -1118,61 +1164,38 @@ class WarpGSplatRasterizeValues(torch.autograd.Function):
                 out.requires_grad_(requires_grad)
                 return out
 
-            with torch.enable_grad():
-                means = _clone_for_grad(means_src, means_req)
-                quat = _clone_for_grad(quat_src, quat_req)
-                scale = _clone_for_grad(scale_src, scale_req)
-                viewmat = _clone_for_grad(viewmat_src, viewmat_req)
-                K = _clone_for_grad(K_src, K_req)
+            projection_tape = getattr(ctx, "projection_tape", None)
 
-                xys_ref, conic_ref, rho_ref, _num_tiles_hit, _tile_min, _tile_max, _depth_key = (
-                    _project_gaussians_reference_local(
-                        means,
-                        quat,
-                        scale,
-                        viewmat,
-                        K,
-                        int(ctx.width),
-                        int(ctx.height),
-                        ctx.cfg,
-                    )
+            def _warp_grad_or_none(wparr):
+                if getattr(wparr, "grad", None) is None:
+                    return None
+                return wp.to_torch(wparr.grad)
+
+            if projection_tape is not None:
+                projection_tape.backward(
+                    grads={
+                        xys_wp: _wrap_input_tensor(grad_xys_t.contiguous(), wp.vec2f, requires_grad=False),
+                        conic_wp: _wrap_input_tensor(grad_conic_t.contiguous(), wp.vec3f, requires_grad=False),
+                        rho_wp: _wrap_input_tensor(grad_rho_t.contiguous(), wp.float32, requires_grad=False),
+                    }
                 )
 
-                grad_inputs: list[Tensor] = []
-                for tensor, required in (
-                    (means, means_req),
-                    (quat, quat_req),
-                    (scale, scale_req),
-                    (viewmat, viewmat_req),
-                    (K, K_req),
-                ):
-                    if required:
-                        grad_inputs.append(tensor)
-
-                if grad_inputs:
-                    projection_grads = torch.autograd.grad(
-                        outputs=(xys_ref, conic_ref, rho_ref),
-                        inputs=grad_inputs,
-                        grad_outputs=(grad_xys_t, grad_conic_t, grad_rho_t),
-                        allow_unused=True,
-                    )
-                else:
-                    projection_grads = ()
-
-            grad_iter = iter(projection_grads)
-
-            def _next(required: bool):
-                return next(grad_iter) if required else None
+            means_grad = _warp_grad_or_none(_wp_means) if means_req else None
+            quat_grad = _warp_grad_or_none(_wp_quat) if quat_req else None
+            scale_grad = _warp_grad_or_none(_wp_scale) if scale_req else None
+            viewmat_grad = _warp_grad_or_none(_wp_viewmat) if viewmat_req else None
+            K_grad = _warp_grad_or_none(_wp_K) if K_req else None
 
             return (
-                _next(means_req),
-                _next(quat_req),
-                _next(scale_req),
+                means_grad,
+                quat_grad,
+                scale_grad,
                 values_grad,
                 opacity_grad,
                 None,
-                _next(viewmat_req),
-                _next(K_req),
+                viewmat_grad,
+                K_grad,
+                None,
                 None,
                 None,
                 None,
@@ -1180,7 +1203,7 @@ class WarpGSplatRasterizeValues(torch.autograd.Function):
             )
 
         if ctx.saved is None or ctx.tape is None:
-            return (None,) * 12
+            return (None,) * 13
 
         (
             wp_means,
@@ -1197,14 +1220,19 @@ class WarpGSplatRasterizeValues(torch.autograd.Function):
             _tile_end,
             _sorted_vals,
             out_values,
+            _final_T,
+            _stop_idx,
+            _background_is_zero,
         ) = ctx.saved
 
         if grad_out is None:
-            return (None,) * 12
+            return (None,) * 13
         if not grad_out.is_contiguous():
             grad_out = grad_out.contiguous()
 
-        wp_grad = _wrap_input_tensor(grad_out.view(-1), wp.float32, requires_grad=False)
+        channels = int(ctx.value_shape[1])
+        value_vec_dtype = wp.types.vector(length=channels, dtype=wp.float32)
+        wp_grad = _wrap_input_tensor(grad_out.reshape(-1, channels).contiguous(), value_vec_dtype, requires_grad=False)
         ctx.tape.backward(grads={out_values: wp_grad})
 
         def _grad_or_none(wparr):
@@ -1229,6 +1257,7 @@ class WarpGSplatRasterizeValues(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -1242,9 +1271,15 @@ def prepare_visibility_warp(
     height: int,
     cfg: RasterConfig | None = None,
     requires_grad: bool = False,
+    active_count: int | None = None,
 ) -> PreparedVisibility:
     if cfg is None:
         cfg = RasterConfig()
+    if active_count is not None:
+        count = max(0, min(int(active_count), int(means.shape[0])))
+        means = means[:count]
+        quat = quat[:count]
+        scale = scale[:count]
     _validate_render_inputs(
         means=means,
         quat=quat,
@@ -1284,11 +1319,20 @@ def render_values_warp(
     cfg: RasterConfig | None = None,
     background: Tensor | None = None,
     return_prepared: bool = False,
+    active_count: int | None = None,
 ) -> Tensor | tuple[Tensor, PreparedVisibility]:
     if cfg is None:
         cfg = RasterConfig()
+    background_is_zero = background is None
     if background is None:
         background = torch.zeros(values.shape[1], device=values.device, dtype=values.dtype)
+    if active_count is not None:
+        count = max(0, min(int(active_count), int(means.shape[0])))
+        means = means[:count]
+        quat = quat[:count]
+        scale = scale[:count]
+        values = values[:count]
+        opacity = opacity[:count]
 
     if return_prepared:
         out, xys, conic, rho, num_tiles_hit, tile_start, tile_end, sorted_vals = WarpGSplatRasterizeValues.apply(
@@ -1304,6 +1348,7 @@ def render_values_warp(
             int(height),
             cfg,
             True,
+            background_is_zero,
         )
         tile_size = int(cfg.tile_size)
         tiles_x, tiles_y, tile_count = estimate_tiles(int(width), int(height), tile_size)
@@ -1337,6 +1382,7 @@ def render_values_warp(
         int(height),
         cfg,
         False,
+        background_is_zero,
     )
 
 
@@ -1348,9 +1394,12 @@ def render_stats_prepared_warp(
     residual_map: Tensor | None = None,
     screen_error_bins: int = 4,
     include_details: bool = True,
+    active_count: int | None = None,
 ) -> dict[str, Tensor]:
     if cfg is None:
         cfg = RasterConfig()
+    if active_count is not None:
+        opacity = opacity[: int(active_count)]
     _assert_cuda_float32_contiguous(opacity, "opacity")
     _assert_1d(opacity, "opacity")
     if int(opacity.shape[0]) != prepared.gaussian_count:
@@ -1403,12 +1452,16 @@ def render_stats_prepared_warp(
 
     device_str = _ensure_warp_ready(prepared.device)
     stream = _warp_stream(prepared.device)
-    antialiased = 1 if cfg.rasterize_mode == "antialiased" else 0
+    stats_kernel = specialize_visibility_stats_kernel(
+        antialiased=cfg.rasterize_mode == "antialiased",
+        error_bins_x=bins,
+        error_bins_y=bins,
+    )
     opacity_stats = opacity.detach()
     residual_stats = residual_map.detach()
     with wp.ScopedStream(stream, sync_enter=False, sync_exit=False):
         wp.launch(
-            rasterize_visibility_stats_kernel,
+            stats_kernel,
             dim=prepared.width * prepared.height,
             inputs=[
                 prepared.tile_start,
@@ -1423,17 +1476,14 @@ def render_stats_prepared_warp(
                 prepared.tiles_x,
                 prepared.tile_size,
                 residual_stats.view(-1),
-                bins,
-                bins,
                 float(cfg.alpha_min),
                 float(cfg.transmittance_eps),
                 float(cfg.clamp_alpha_max),
-                int(antialiased),
             ],
             outputs=[contrib, trans, hits, residual, error_map.view(-1)],
             device=device_str,
             stream=stream,
-            block_dim=_WARP_BLOCK_DIM,
+            block_dim=_warp_block_dim(),
         )
 
     return {
@@ -1461,9 +1511,19 @@ def render_stats_warp(
     screen_error_bins: int = 4,
     include_details: bool = True,
     prepared: PreparedVisibility | None = None,
+    active_count: int | None = None,
 ) -> dict[str, Tensor]:
     if cfg is None:
         cfg = RasterConfig()
+    if active_count is not None:
+        count = max(0, min(int(active_count), int(opacity.shape[0])))
+        opacity = opacity[:count]
+        if means is not None:
+            means = means[:count]
+        if quat is not None:
+            quat = quat[:count]
+        if scale is not None:
+            scale = scale[:count]
     if prepared is None:
         if (
             means is None
@@ -1499,6 +1559,7 @@ def render_stats_warp(
         residual_map=residual_map,
         screen_error_bins=screen_error_bins,
         include_details=include_details,
+        active_count=active_count,
     )
 
 
@@ -1513,10 +1574,19 @@ def render_visibility_meta_warp(
     width: int | None = None,
     height: int | None = None,
     cfg: RasterConfig | None = None,
+    active_count: int | None = None,
 ) -> dict[str, Tensor]:
     if cfg is None:
         cfg = RasterConfig()
     if prepared is None:
+        if active_count is not None:
+            count = max(0, min(int(active_count), int(means.shape[0]) if means is not None else 0))
+            if means is not None:
+                means = means[:count]
+            if quat is not None:
+                quat = quat[:count]
+            if scale is not None:
+                scale = scale[:count]
         if (
             means is None
             or quat is None
@@ -1546,6 +1616,67 @@ def render_visibility_meta_warp(
             _launch_project(state, cfg, stream=stream)
             prepared = _prepare_sorted_intersections(state, cfg, stream=stream)
     return prepared.meta()
+
+
+def render_projection_meta_warp(
+    *,
+    means: Tensor,
+    quat: Tensor,
+    scale: Tensor,
+    viewmat: Tensor,
+    K: Tensor,
+    width: int,
+    height: int,
+    cfg: RasterConfig | None = None,
+    active_count: int | None = None,
+) -> dict[str, int | bool | str | None]:
+    if cfg is None:
+        cfg = RasterConfig()
+    if active_count is not None:
+        count = max(0, min(int(active_count), int(means.shape[0])))
+        means = means[:count]
+        quat = quat[:count]
+        scale = scale[:count]
+    state = _allocate_visibility_state(
+        means=means,
+        quat=quat,
+        scale=scale,
+        viewmat=viewmat,
+        K=K,
+        width=int(width),
+        height=int(height),
+        cfg=cfg,
+        requires_grad=False,
+        reuse_scratch=True,
+    )
+    stream = _warp_stream(means.device)
+    with wp.ScopedStream(stream, sync_enter=False, sync_exit=False):
+        _launch_project(state, cfg, stream=stream)
+    num_tiles_hit_t: Tensor = state["num_tiles_hit_t"]  # type: ignore[assignment]
+    gaussian_count = int(state["gaussian_count"])
+    visible_count = int((num_tiles_hit_t > 0).sum(dtype=torch.int64).item())
+    intersection_count = int(num_tiles_hit_t.sum(dtype=torch.int64).item()) if gaussian_count > 0 else 0
+    _use_warp_radix, chosen_mode, chosen_bytes, warp_sort_bytes, torch_sort_bytes = _select_sort_mode_and_bytes(
+        intersection_count,
+        cfg,
+    )
+    budget = cfg.max_sort_buffer_bytes
+    return {
+        "gaussian_count": gaussian_count,
+        "visible_count": visible_count,
+        "intersection_count": intersection_count,
+        "tile_count": int(state["tile_count"]),
+        "tiles_x": int(state["tiles_x"]),
+        "tiles_y": int(state["tiles_y"]),
+        "render_width": int(width),
+        "render_height": int(height),
+        "sort_mode": chosen_mode,
+        "estimated_sort_buffer_bytes": int(chosen_bytes),
+        "warp_sort_buffer_bytes": int(warp_sort_bytes),
+        "torch_sort_buffer_bytes": int(torch_sort_bytes),
+        "sort_buffer_budget_bytes": None if budget is None else int(budget),
+        "sort_buffer_within_budget": bool(budget is None or chosen_bytes <= budget),
+    }
 
 
 def render_gaussians_warp(
@@ -1593,6 +1724,7 @@ __all__ = [
     "WarpGSplatRasterizeValues",
     "prepare_visibility_warp",
     "render_values_warp",
+    "render_projection_meta_warp",
     "render_visibility_meta_warp",
     "render_stats_prepared_warp",
     "render_stats_warp",

@@ -1,7 +1,8 @@
 import torch
 from hypothesis import given, strategies as st
 
-from blender_temp.gaussian_sr.field import CanonicalGaussianField
+from blender_temp.gaussian_sr.field import CanonicalGaussianField, ScaleAwareResidualHead
+from blender_temp.gaussian_sr.image_utils import pixel_grid
 from blender_temp.gaussian_sr.posefree_config import AppearanceConfig, FieldConfig
 
 from .strategies import DEFAULT_SETTINGS, chw_images
@@ -29,16 +30,17 @@ def _make_field(anchor_rgb: torch.Tensor, stride: int, feature_dim: int) -> tupl
 
 def _assert_aligned_lengths(field: CanonicalGaussianField) -> None:
     n = field.num_gaussians
-    assert field.uv.shape[0] == n
-    assert field.depth_raw.shape[0] == n
-    assert field.xyz_offset.shape[0] == n
-    assert field.quat_raw.shape[0] == n
-    assert field.log_scale.shape[0] == n
-    assert field.opacity_logit.shape[0] == n
-    assert field.rgb_logit.shape[0] == n
-    assert field.latent.shape[0] == n
+    assert field.uv[:n].shape[0] == n
+    assert field.seed_id[:n].shape[0] == n
+    assert field.protect_until_step[:n].shape[0] == n
+    assert field.means3d[:n].shape[0] == n
+    assert field.quat_raw[:n].shape[0] == n
+    assert field.log_scale[:n].shape[0] == n
+    assert field.opacity_logit[:n].shape[0] == n
+    assert field.rgb_logit[:n].shape[0] == n
+    assert field.latent[:n].shape[0] == n
     if field.sh_coeffs is not None:
-        assert field.sh_coeffs.shape[0] == n
+        assert field.sh_coeffs[:n].shape[0] == n
 
 
 @DEFAULT_SETTINGS
@@ -143,3 +145,90 @@ def test_split_gaussians_increases_count_and_keeps_finite_state(
     assert field.num_gaussians == before + len(split_indices)
     params = field.gaussian_params(intrinsics)
     assert torch.isfinite(params["means3d"]).all()
+
+
+def test_scale_aware_residual_head_matches_legacy_pointwise_mlp() -> None:
+    class _LegacyResidualHead(torch.nn.Module):
+        def __init__(self, feature_dim: int, hidden_dim: int, residual_scale: float) -> None:
+            super().__init__()
+            self.residual_scale = residual_scale
+            self.net = torch.nn.Sequential(
+                torch.nn.Linear(feature_dim + 4, hidden_dim),
+                torch.nn.SiLU(),
+                torch.nn.Linear(hidden_dim, hidden_dim),
+                torch.nn.SiLU(),
+                torch.nn.Linear(hidden_dim, 3),
+            )
+
+        def forward(self, latent_map: torch.Tensor, scale_x: float, scale_y: float) -> torch.Tensor:
+            f_dim, h, w = latent_map.shape
+            coords = pixel_grid(h, w, latent_map.device, latent_map.dtype, normalized=True).view(-1, 2)
+            scale_token = latent_map.new_tensor([
+                torch.log(latent_map.new_tensor(scale_x)),
+                torch.log(latent_map.new_tensor(scale_y)),
+            ])
+            scale_token = scale_token.expand(coords.shape[0], 2)
+            feats = latent_map.permute(1, 2, 0).reshape(-1, f_dim)
+            residual = self.net(torch.cat((feats, coords, scale_token), dim=-1)).view(h, w, 3).permute(2, 0, 1)
+            return self.residual_scale * torch.tanh(residual)
+
+    feature_dim = 3
+    hidden_dim = 7
+    residual_scale = 0.15
+    legacy = _LegacyResidualHead(feature_dim, hidden_dim, residual_scale)
+    current = ScaleAwareResidualHead(
+        feature_dim=feature_dim,
+        hidden_dim=hidden_dim,
+        residual_scale=residual_scale,
+    )
+
+    with torch.no_grad():
+        current.net[0].weight.copy_(legacy.net[0].weight.view(hidden_dim, feature_dim + 4, 1, 1))
+        current.net[0].bias.copy_(legacy.net[0].bias)
+        current.net[2].weight.copy_(legacy.net[2].weight.view(hidden_dim, hidden_dim, 1, 1))
+        current.net[2].bias.copy_(legacy.net[2].bias)
+        current.net[4].weight.copy_(legacy.net[4].weight.view(3, hidden_dim, 1, 1))
+        current.net[4].bias.copy_(legacy.net[4].bias)
+
+    latent = torch.randn(feature_dim, 5, 4, dtype=torch.float32)
+    expected = legacy(latent, scale_x=1.5, scale_y=0.75)
+    actual = current(latent, scale_x=1.5, scale_y=0.75)
+
+    torch.testing.assert_close(actual, expected, atol=1.0e-6, rtol=1.0e-6)
+
+
+def test_density_mutations_preserve_parameter_identity_with_fixed_capacity() -> None:
+    anchor_rgb = torch.full((3, 4, 4), 0.5, dtype=torch.float32)
+    field_cfg = FieldConfig(anchor_stride=2, feature_dim=2, gaussian_capacity=8)
+    field = CanonicalGaussianField(
+        anchor_rgb,
+        _make_intrinsics(anchor_rgb.shape[-2], anchor_rgb.shape[-1]),
+        field_cfg,
+        AppearanceConfig(mode="constant"),
+    )
+
+    param_ids_before = {
+        "means3d": id(field.means3d),
+        "quat_raw": id(field.quat_raw),
+        "log_scale": id(field.log_scale),
+        "opacity_logit": id(field.opacity_logit),
+        "rgb_logit": id(field.rgb_logit),
+        "latent": id(field.latent),
+    }
+    capacity_before = field.gaussian_capacity
+
+    field.clone_gaussians(torch.tensor([0], dtype=torch.long))
+    field.split_gaussians(torch.tensor([1], dtype=torch.long))
+    keep = torch.ones(field.num_gaussians, dtype=torch.bool)
+    keep[-1] = False
+    field.prune_keep_mask(keep)
+
+    assert field.gaussian_capacity == capacity_before
+    assert param_ids_before == {
+        "means3d": id(field.means3d),
+        "quat_raw": id(field.quat_raw),
+        "log_scale": id(field.log_scale),
+        "opacity_logit": id(field.opacity_logit),
+        "rgb_logit": id(field.rgb_logit),
+        "latent": id(field.latent),
+    }

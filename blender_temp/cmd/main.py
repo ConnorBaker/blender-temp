@@ -663,8 +663,14 @@ def setup_argparse() -> ArgumentParser:
     )
     parser.add_argument(
         "--renderer-backward-impl",
-        choices=("hybrid", "reference", "warp_tape"),
+        choices=("hybrid", "reference", "warp_tape", "helion"),
         help="Override the renderer backward implementation",
+        default=None,
+    )
+    parser.add_argument(
+        "--renderer-backend",
+        choices=("warp", "helion"),
+        help="Select the renderer backend",
         default=None,
     )
     parser.add_argument(
@@ -724,6 +730,11 @@ def setup_argparse() -> ArgumentParser:
         "--allow-unsafe-config",
         action="store_true",
         help="Proceed even when preflight safety checks flag a high-risk configuration",
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Run projection-only stage preflight checks, write preflight.json, and exit without training",
     )
     return parser
 
@@ -865,6 +876,47 @@ def assess_run_safety(
     return issues
 
 
+def estimate_initial_gaussian_count(height: int, width: int, anchor_stride: int) -> int:
+    if anchor_stride <= 0:
+        raise ValueError("anchor_stride must be positive")
+    anchor_h = (int(height) + int(anchor_stride) - 1) // int(anchor_stride)
+    anchor_w = (int(width) + int(anchor_stride) - 1) // int(anchor_stride)
+    return int(anchor_h * anchor_w)
+
+
+def build_anchor_stride_seed_table(
+    height: int,
+    width: int,
+    current_stride: int,
+    *,
+    candidate_strides: tuple[int, ...] = (1, 2, 4, 8, 16, 32),
+) -> list[dict[str, int]]:
+    max_dim = max(int(height), int(width), int(current_stride))
+    strides = sorted({int(current_stride)} | {int(s) for s in candidate_strides if 0 < int(s) <= max_dim})
+    rows: list[dict[str, int]] = []
+    for stride in strides:
+        anchor_h = (int(height) + stride - 1) // stride
+        anchor_w = (int(width) + stride - 1) // stride
+        rows.append({
+            "anchor_stride": int(stride),
+            "anchor_height": int(anchor_h),
+            "anchor_width": int(anchor_w),
+            "estimated_gaussians": int(anchor_h * anchor_w),
+        })
+    return rows
+
+
+def format_seed_estimate_table(rows: list[dict[str, int]]) -> str:
+    return ", ".join(
+        (
+            f"stride={int(row['anchor_stride'])} -> "
+            f"{int(row['estimated_gaussians'])} "
+            f"({int(row['anchor_height'])}x{int(row['anchor_width'])})"
+        )
+        for row in rows
+    )
+
+
 def format_scale_tag(scale: float) -> str:
     return format(scale, "g")
 
@@ -963,6 +1015,7 @@ def main() -> None:
     profile_pytorch: bool = bool(args.profile_pytorch)
     disable_torch_compile: bool = bool(args.disable_torch_compile)
     renderer_backward_impl: str | None = args.renderer_backward_impl
+    renderer_backend: str | None = args.renderer_backend
     debug_preview_every_arg: int | None = args.debug_preview_every
     diagnostic_meta_every_arg: int | None = args.diagnostic_meta_every
     debug_stage2_checkpoint_every: int = int(args.debug_stage2_checkpoint_every)
@@ -973,6 +1026,7 @@ def main() -> None:
     collapse_view_persistence: int = int(args.collapse_view_persistence)
     disable_runtime_observer: bool = bool(args.disable_runtime_observer)
     allow_unsafe_config: bool = bool(args.allow_unsafe_config)
+    preflight_only: bool = bool(args.preflight_only)
 
     if not input_dir.is_dir():
         LOGGER.error("Input directory not found: %s", input_dir)
@@ -1086,6 +1140,7 @@ def main() -> None:
     LOGGER.info("View batch size: %s", "all" if view_batch_size == 0 else view_batch_size)
     LOGGER.info("Radius clip px: %s", radius_clip_px if radius_clip_px > 0.0 else "disabled")
     LOGGER.info("Torch compile: %s", "disabled" if disable_torch_compile else "enabled")
+    LOGGER.info("Renderer backend: %s", renderer_backend or "config default")
     LOGGER.info("Renderer backward: %s", renderer_backward_impl or "config default")
     LOGGER.info(
         "Density control final stage: %s",
@@ -1172,10 +1227,12 @@ def main() -> None:
         )
         LOGGER.info("Using the training config embedded in the resume checkpoint.")
 
+    if renderer_backend is not None:
+        cfg.render.backend = renderer_backend
+
     intrinsics = None
-    anchor_h = (images.shape[-2] + cfg.field.anchor_stride - 1) // cfg.field.anchor_stride
-    anchor_w = (images.shape[-1] + cfg.field.anchor_stride - 1) // cfg.field.anchor_stride
-    estimated_gaussians = int(anchor_h * anchor_w)
+    estimated_gaussians = estimate_initial_gaussian_count(images.shape[-2], images.shape[-1], cfg.field.anchor_stride)
+    seed_table = build_anchor_stride_seed_table(images.shape[-2], images.shape[-1], cfg.field.anchor_stride)
     view_batch_desc = "all" if cfg.train.view_batch_size <= 0 else str(cfg.train.view_batch_size)
     LOGGER.info(
         "Init config: frames=%d resolution=%dx%d anchor_stride=%d est_gaussians=%d view_batch_size=%s",
@@ -1186,6 +1243,7 @@ def main() -> None:
         estimated_gaussians,
         view_batch_desc,
     )
+    LOGGER.info("Seed lattice estimate table: %s", format_seed_estimate_table(seed_table))
     if estimated_gaussians > 250_000:
         LOGGER.warning(
             "Large initial Gaussian count (%d). Expect slow steps. Consider larger anchor_stride and/or fewer frames per step.",
@@ -1203,14 +1261,35 @@ def main() -> None:
         restored_rng_state = _restore_rng_state(resume_payload or {})
         LOGGER.info("Restored RNG state from checkpoint: %s", "yes" if restored_rng_state else "no")
     if renderer_backward_impl is not None:
-        original_renderer_config = pipeline._renderer_config
-
-        def _patched_renderer_config():
-            render_cfg = original_renderer_config()
-            render_cfg.backward_impl = renderer_backward_impl
-            return render_cfg
-
-        pipeline._renderer_config = _patched_renderer_config
+        cfg.render.backward_impl = renderer_backward_impl
+    if preflight_only:
+        LOGGER.info("Running projection-only stage preflight; no training steps will execute.")
+        preflight_results = pipeline.preflight_training_stages()
+        preflight_payload = {
+            "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "input_dir": str(input_dir),
+            "output_dir": str(output_dir),
+            "device": str(device),
+            "image_shape": list(images.shape),
+            "seed_estimates": seed_table,
+            "stage_preflight": preflight_results,
+        }
+        preflight_path = output_dir / "preflight.json"
+        preflight_path.write_text(json.dumps(preflight_payload, indent=2, sort_keys=True), encoding="utf-8")
+        unsafe = [stage for stage in preflight_results if not bool(stage.get("all_within_budget", True))]
+        LOGGER.info("Wrote projection preflight report to %s", preflight_path)
+        if unsafe:
+            worst_stage = max(unsafe, key=lambda stage: int(stage.get("max_estimated_sort_buffer_bytes", 0)))
+            LOGGER.error(
+                "Projection preflight found %d unsafe stage(s); worst stage=%d view=%d estimated_sort_bytes=%.2f GiB",
+                len(unsafe),
+                int(worst_stage["stage_index"]) + 1,
+                int(worst_stage["worst_view_index"]),
+                float(int(worst_stage["max_estimated_sort_buffer_bytes"])) / float(1024**3),
+            )
+            raise SystemExit(1)
+        LOGGER.info("Projection preflight passed for all configured stages.")
+        return
     LOGGER.info("Training scene model...")
     observer_requested = (
         debug_preview_every > 0

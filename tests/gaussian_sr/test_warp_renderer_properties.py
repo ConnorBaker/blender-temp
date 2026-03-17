@@ -4,6 +4,7 @@ from hypothesis import given, strategies as st
 from torch.testing import assert_close
 
 from blender_temp.gaussian_sr import RasterConfig, render_stats_prepared_warp, render_stats_warp, render_values_warp
+from blender_temp.gaussian_sr.warp_gsplat_renderer import render_projection_meta_warp, render_visibility_meta_warp
 from blender_temp.gaussian_sr.warp_runtime import _WARP_AVAILABLE
 
 CUDA_WARP_AVAILABLE = bool(_WARP_AVAILABLE and torch.cuda.is_available())
@@ -308,3 +309,47 @@ def test_prepared_stats_launch_cache_accepts_grad_tracking_inputs() -> None:
     assert torch.isfinite(stats["contrib"]).all()
     assert torch.isfinite(stats["residual"]).all()
     assert torch.isfinite(stats["error_map"]).all()
+
+
+@pytest.mark.skipif(not CUDA_WARP_AVAILABLE, reason="requires CUDA + NVIDIA Warp")
+def test_projection_meta_matches_visibility_meta_counts_and_budget() -> None:
+    device = torch.device("cuda")
+    width = 8
+    height = 6
+    scene = _make_visible_scene(n=3, width=width, height=height, device=device)
+    cfg = RasterConfig(max_sort_buffer_bytes=128 * 1024 * 1024)
+
+    projection_meta = render_projection_meta_warp(
+        means=scene["means"],
+        quat=scene["quat"],
+        scale=scene["scale"],
+        viewmat=scene["viewmat"],
+        K=scene["K"],
+        width=width,
+        height=height,
+        cfg=cfg,
+    )
+    visibility_meta = render_visibility_meta_warp(
+        means=scene["means"],
+        quat=scene["quat"],
+        scale=scene["scale"],
+        viewmat=scene["viewmat"],
+        K=scene["K"],
+        width=width,
+        height=height,
+        cfg=cfg,
+    )
+
+    assert projection_meta["gaussian_count"] == int(visibility_meta["meta_gaussian_count"].item())
+    assert projection_meta["visible_count"] == int(visibility_meta["meta_visible_count"].item())
+    assert projection_meta["intersection_count"] == int(visibility_meta["meta_intersection_count"].item())
+    assert projection_meta["tile_count"] == int(visibility_meta["meta_tile_count"].item())
+    assert projection_meta["tiles_x"] == int(visibility_meta["meta_tiles_x"].item())
+    assert projection_meta["tiles_y"] == int(visibility_meta["meta_tiles_y"].item())
+    assert projection_meta["render_width"] == int(visibility_meta["meta_render_width"].item())
+    assert projection_meta["render_height"] == int(visibility_meta["meta_render_height"].item())
+    assert projection_meta["sort_mode"] in {"warp_radix", "torch_sort"}
+    assert int(projection_meta["estimated_sort_buffer_bytes"]) >= 0
+    assert bool(projection_meta["sort_buffer_within_budget"]) is True
+    assert int(projection_meta["torch_sort_buffer_bytes"]) == int(projection_meta["intersection_count"]) * 12
+    assert int(projection_meta["warp_sort_buffer_bytes"]) == int(projection_meta["intersection_count"]) * 24

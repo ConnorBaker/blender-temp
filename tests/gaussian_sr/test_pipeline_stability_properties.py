@@ -48,6 +48,91 @@ def test_make_optional_compiled_respects_disabled_flag(monkeypatch: pytest.Monke
     assert compile_calls == []
 
 
+def test_ordinary_step_view_batch_size_defaults_and_respects_overrides() -> None:
+    cfg = PoseFreeGaussianConfig()
+
+    assert pipeline_module._ordinary_step_view_batch_size(cfg.train, num_views=3) == 3
+    assert pipeline_module._ordinary_step_view_batch_size(cfg.train, num_views=8) == 2
+
+    cfg.train.ordinary_step_view_batch = 5
+    assert pipeline_module._ordinary_step_view_batch_size(cfg.train, num_views=8) == 5
+
+    cfg.train.view_batch_size = 2
+    assert pipeline_module._ordinary_step_view_batch_size(cfg.train, num_views=8) == 2
+
+
+def test_round_robin_view_ids_is_deterministic_and_covers_all_views() -> None:
+    windows = [pipeline_module._round_robin_view_ids(6, 4, step_seed=i) for i in range(3)]
+
+    assert windows == [[0, 1, 2, 3], [4, 5, 0, 1], [2, 3, 4, 5]]
+    assert sorted({view for window in windows for view in window}) == [0, 1, 2, 3, 4, 5]
+
+
+def test_density_event_is_stable_for_freeze_requires_coverage_and_no_rescue() -> None:
+    cfg = PoseFreeGaussianConfig().density
+
+    class _DummyDensityEvent:
+        def __init__(self, ran: bool, debug_payload: dict[str, object]) -> None:
+            self.ran = ran
+            self._debug_payload = debug_payload
+
+        def debug_dict(self) -> dict[str, object]:
+            return self._debug_payload
+
+    event = _DummyDensityEvent(ran=False, debug_payload={})
+    stable_event = _DummyDensityEvent(
+        ran=True,
+        debug_payload={
+            "weak_view_indices": [],
+            "reseed_view_indices": [],
+            "visible_fraction_of_best": [0.95, 0.92],
+            "intersection_fraction_of_best": [0.99, 0.96],
+        },
+    )
+    unstable_event = _DummyDensityEvent(
+        ran=True,
+        debug_payload={
+            "weak_view_indices": [],
+            "reseed_view_indices": [1],
+            "visible_fraction_of_best": [0.95, 0.92],
+            "intersection_fraction_of_best": [0.99, 0.96],
+        },
+    )
+
+    assert pipeline_module._density_event_is_stable_for_freeze(event, cfg) is False
+    assert pipeline_module._density_event_is_stable_for_freeze(stable_event, cfg) is True
+    assert pipeline_module._density_event_is_stable_for_freeze(unstable_event, cfg) is False
+
+
+def test_projection_preflight_message_includes_budget_details() -> None:
+    message = pipeline_module._format_projection_preflight_message(
+        reason="stage_entry",
+        stage_index=1,
+        step_index=-1,
+        global_step=17,
+        record={
+            "view_index": 3,
+            "render_width": 960,
+            "render_height": 540,
+            "gaussian_count": 1234,
+            "visible_count": 1200,
+            "intersection_count": 45678,
+            "sort_mode": "torch_sort",
+            "estimated_sort_buffer_bytes": 3000,
+            "sort_buffer_budget_bytes": 2000,
+        },
+    )
+
+    assert "stage 2" in message
+    assert "view=3" in message
+    assert "render=960x540" in message
+    assert "N=1234" in message
+    assert "M=45678" in message
+    assert "torch_sort" in message
+    assert "radius_clip_px" in message
+    assert "anchor_stride" in message
+
+
 def test_make_optional_compiled_clears_cuda_state_after_oom(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeOOM(torch.OutOfMemoryError):
         pass
@@ -198,7 +283,7 @@ def test_fit_skips_density_control_calls_in_final_stage_when_disabled(monkeypatc
         return rgb, rgb.mean()
 
     def fake_regularization(_field: dict, _stage_alpha: float) -> torch.Tensor:
-        return pipeline.field_model.depth_raw.sum() * 0.0
+        return pipeline.field_model.means3d.sum() * 0.0
 
     def fake_render_stats_from_prepared(
         prepared: object,
@@ -222,6 +307,7 @@ def test_fit_skips_density_control_calls_in_final_stage_when_disabled(monkeypatc
         _cfg,
         step: int,
         render_stats: dict[str, torch.Tensor] | None = None,
+        **_kwargs,
     ) -> DensityControlResult:
         del render_stats
         density_calls.append(step)
@@ -236,7 +322,32 @@ def test_fit_skips_density_control_calls_in_final_stage_when_disabled(monkeypatc
             debug=None,
         )
 
+    def fake_training_view_forward(
+        _base_intrinsics: torch.Tensor,
+        _render_intrinsics: torch.Tensor,
+        _R_cw: torch.Tensor,
+        _t_cw: torch.Tensor,
+        _target: torch.Tensor,
+        out_h: int,
+        out_w: int,
+    ) -> tuple[torch.Tensor, ...]:
+        render_call_modes.append(("train", False))
+        return (
+            pipeline.field_model.means3d.sum() * 0.0,
+            torch.tensor(True),
+            torch.tensor(True),
+            torch.tensor(pipeline.field_model.num_gaussians, dtype=torch.int64),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(out_w, dtype=torch.int64),
+            torch.tensor(out_h, dtype=torch.int64),
+        )
+
     monkeypatch.setattr(pipeline, "render_with_pose", fake_render_with_pose)
+    monkeypatch.setattr(pipeline, "_training_view_forward", fake_training_view_forward)
     monkeypatch.setattr(pipeline, "_observe_and_photometric_loss", fake_observe_and_photometric_loss)
     monkeypatch.setattr(pipeline, "_regularization_impl", fake_regularization)
     monkeypatch.setattr(pipeline, "_render_stats_from_prepared", fake_render_stats_from_prepared)
@@ -244,8 +355,8 @@ def test_fit_skips_density_control_calls_in_final_stage_when_disabled(monkeypatc
 
     history = pipeline.fit(images, progress_event_callback=progress_events.append)
 
-    assert density_calls == [0, 1]
-    assert render_call_modes == [("meta", True), ("meta", True), ("meta", False)]
+    assert density_calls == [0]
+    assert render_call_modes == [("train", False), ("meta", True), ("meta", True), ("train", False)]
     assert all(event["stage_index"] != 2 for event in history["density_events"])
     assert any(
         event["event"] == "step_start" and event["stage_index"] == 2 and event["density_due"] is False
@@ -286,7 +397,7 @@ def test_render_with_pose_meta_stats_prepares_once_and_skips_full_stats(monkeypa
         opacity = torch.ones(n, dtype=torch.float32)
         values = torch.zeros((n, values_channels), dtype=torch.float32)
         background = torch.zeros(values_channels, dtype=torch.float32)
-        return field, viewmat, K, means, quat, scale, opacity, values, background
+        return field, viewmat, K, means, quat, scale, opacity, values, background, n
 
     def fake_render_values_warp(**kwargs):
         call_order.append(("values", kwargs["return_prepared"]))
@@ -397,9 +508,33 @@ def test_fit_progress_callback_does_not_enable_sync_profile_and_step_callback_ru
         return rgb, rgb.mean()
 
     def fake_regularization(_field: dict, _stage_alpha: float) -> torch.Tensor:
-        return pipeline.field_model.depth_raw.sum() * 0.0
+        return pipeline.field_model.means3d.sum() * 0.0
+
+    def fake_training_view_forward(
+        _base_intrinsics: torch.Tensor,
+        _render_intrinsics: torch.Tensor,
+        _R_cw: torch.Tensor,
+        _t_cw: torch.Tensor,
+        _target: torch.Tensor,
+        out_h: int,
+        out_w: int,
+    ) -> tuple[torch.Tensor, ...]:
+        return (
+            pipeline.field_model.means3d.sum() * 0.0,
+            torch.tensor(True),
+            torch.tensor(True),
+            torch.tensor(pipeline.field_model.num_gaussians, dtype=torch.int64),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(out_w, dtype=torch.int64),
+            torch.tensor(out_h, dtype=torch.int64),
+        )
 
     monkeypatch.setattr(pipeline, "render_with_pose", fake_render_with_pose)
+    monkeypatch.setattr(pipeline, "_training_view_forward", fake_training_view_forward)
     monkeypatch.setattr(pipeline, "_observe_and_photometric_loss", fake_observe_and_photometric_loss)
     monkeypatch.setattr(pipeline, "_regularization_impl", fake_regularization)
 
@@ -410,8 +545,8 @@ def test_fit_progress_callback_does_not_enable_sync_profile_and_step_callback_ru
     )
 
     assert len(history["loss"]) == 2
-    assert profile_flags == [False, False]
-    assert step_calls == [(0, 0, 0), (0, 1, 1)]
+    assert profile_flags == []
+    assert step_calls == [(0, 0, -1), (0, 1, 0)]
     assert any(event["event"] == "step_end" for event in progress_events)
 
 
@@ -436,7 +571,7 @@ def test_regularization_without_render_field_stays_finite_after_density_growth()
     assert torch.isfinite(reg)
 
 
-def test_rebuild_optimizer_after_density_resets_all_optimizer_state() -> None:
+def test_rebuild_optimizer_after_density_preserves_optimizer_when_field_storage_is_fixed() -> None:
     images = torch.zeros((2, 3, 4, 4), dtype=torch.float32)
 
     cfg = PoseFreeGaussianConfig()
@@ -479,6 +614,208 @@ def test_rebuild_optimizer_after_density_resets_all_optimizer_state() -> None:
         appended_count=1,
     )
 
-    for group in rebuilt.param_groups:
-        for param in group["params"]:
-            assert not rebuilt.state.get(param, {})
+    assert rebuilt is opt
+    assert rebuilt.state[camera_param]["step"].item() == camera_state["step"].item()
+    assert torch.equal(rebuilt.state[camera_param]["exp_avg"], camera_state["exp_avg"])
+    assert torch.equal(rebuilt.state[camera_param]["exp_avg_sq"], camera_state["exp_avg_sq"])
+
+    field_param = rebuilt.param_groups[0]["params"][0]
+    assert field_param is pipeline.field_model.means3d
+    assert rebuilt.state[field_param]["step"].item() == 7.0
+
+
+def test_stage_entry_projection_preflight_aborts_before_render_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    images = torch.zeros((1, 3, 4, 4), dtype=torch.float32)
+
+    cfg = PoseFreeGaussianConfig()
+    cfg.camera.learn_intrinsics = False
+    cfg.appearance.mode = "constant"
+    cfg.field.use_residual_head = False
+    cfg.field.anchor_stride = 2
+    cfg.train.stage_scales = (0.25,)
+    cfg.train.steps_per_stage = (2,)
+    cfg.train.print_every = 0
+    cfg.density.enabled = False
+
+    pipeline = PoseFreeGaussianSR.from_images(images, intrinsics=None, config=cfg)
+    calls: list[tuple[str, int, int, int]] = []
+
+    def fake_projection_preflight(
+        view_ids,
+        render_h: int,
+        render_w: int,
+        *,
+        stage_index: int,
+        step_index: int,
+        global_step: int,
+        reason: str,
+        progress_event_callback=None,
+        fail_on_error: bool,
+    ):
+        del view_ids, step_index, global_step, progress_event_callback, fail_on_error
+        calls.append((reason, stage_index, render_h, render_w))
+        raise pipeline_module.ProjectionPreflightError({"message": "preflight blocked", "record": {"view_index": 0}})
+
+    def fail_render_with_pose(*_args, **_kwargs):
+        raise AssertionError("render loop should not execute after stage-entry preflight failure")
+
+    monkeypatch.setattr(pipeline, "_run_projection_preflight", fake_projection_preflight)
+    monkeypatch.setattr(pipeline, "render_with_pose", fail_render_with_pose)
+
+    with pytest.raises(pipeline_module.ProjectionPreflightError, match="preflight blocked"):
+        pipeline.fit(images)
+
+    assert calls == [("stage_entry", 0, 1, 1)]
+
+
+def test_post_density_projection_preflight_runs_after_density_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    images = torch.zeros((1, 3, 4, 4), dtype=torch.float32)
+
+    cfg = PoseFreeGaussianConfig()
+    cfg.camera.learn_intrinsics = False
+    cfg.appearance.mode = "constant"
+    cfg.field.use_residual_head = False
+    cfg.field.anchor_stride = 2
+    cfg.train.stage_scales = (0.25,)
+    cfg.train.steps_per_stage = (2,)
+    cfg.train.print_every = 0
+    cfg.density.enabled = True
+    cfg.density.every_steps = 1
+    cfg.density.final_stage_every_steps = 1
+    cfg.density.disable_final_stage = False
+    cfg.density.weak_view_reseed_budget_per_view = 1
+
+    pipeline = PoseFreeGaussianSR.from_images(images, intrinsics=None, config=cfg)
+    preflight_reasons: list[str] = []
+
+    def fake_projection_preflight(
+        view_ids,
+        render_h: int,
+        render_w: int,
+        *,
+        stage_index: int,
+        step_index: int,
+        global_step: int,
+        reason: str,
+        progress_event_callback=None,
+        fail_on_error: bool,
+    ):
+        del view_ids, render_h, render_w, stage_index, progress_event_callback, fail_on_error
+        preflight_reasons.append(reason)
+        if reason == "post_density":
+            raise pipeline_module.ProjectionPreflightError({
+                "message": f"unsafe after density at step {step_index} global {global_step}",
+                "record": {"view_index": 0},
+            })
+        return {
+            "unsafe_view_count": 0,
+            "worst_view_index": 0,
+            "max_intersection_count": 1,
+            "max_estimated_sort_buffer_bytes": 16,
+            "all_within_budget": True,
+            "views": [],
+        }
+
+    prepared_marker = object()
+
+    def fake_render_with_pose(
+        _R_cw: torch.Tensor,
+        _t_cw: torch.Tensor,
+        out_h: int,
+        out_w: int,
+        *,
+        return_aux: bool,
+        stats_mode: str,
+        return_prepared: bool,
+        profile: bool = False,
+    ):
+        del return_aux, stats_mode, profile
+        result = {
+            "rgb": torch.zeros((3, out_h, out_w), dtype=torch.float32),
+            "render_stats": {
+                "meta_gaussian_count": torch.tensor(pipeline.field_model.num_gaussians, dtype=torch.int64),
+                "meta_visible_count": torch.tensor(1, dtype=torch.int64),
+                "meta_intersection_count": torch.tensor(1, dtype=torch.int64),
+                "meta_tile_count": torch.tensor(1, dtype=torch.int64),
+                "meta_tiles_x": torch.tensor(1, dtype=torch.int64),
+                "meta_tiles_y": torch.tensor(1, dtype=torch.int64),
+                "meta_render_width": torch.tensor(out_w, dtype=torch.int64),
+                "meta_render_height": torch.tensor(out_h, dtype=torch.int64),
+            },
+            "profile": {},
+        }
+        if return_prepared:
+            result["_prepared_visibility"] = prepared_marker
+            result["_opacity"] = torch.ones(pipeline.field_model.num_gaussians, dtype=torch.float32)
+        return result
+
+    def fake_observe_and_photometric_loss(render_rgb: torch.Tensor, target: torch.Tensor):
+        del target
+        return render_rgb, pipeline.field_model.means3d.sum() * 0.0
+
+    def fake_regularization(_field, _stage_alpha: float) -> torch.Tensor:
+        return pipeline.field_model.means3d.sum() * 0.0
+
+    def fake_training_view_forward(
+        _base_intrinsics: torch.Tensor,
+        _render_intrinsics: torch.Tensor,
+        _R_cw: torch.Tensor,
+        _t_cw: torch.Tensor,
+        _target: torch.Tensor,
+        out_h: int,
+        out_w: int,
+    ) -> tuple[torch.Tensor, ...]:
+        return (
+            pipeline.field_model.means3d.sum() * 0.0,
+            torch.tensor(True),
+            torch.tensor(True),
+            torch.tensor(pipeline.field_model.num_gaussians, dtype=torch.int64),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(1, dtype=torch.int64),
+            torch.tensor(out_w, dtype=torch.int64),
+            torch.tensor(out_h, dtype=torch.int64),
+        )
+
+    def fake_render_stats_from_prepared(
+        prepared,
+        opacity: torch.Tensor,
+        residual_map: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        del prepared, opacity, residual_map
+        n = pipeline.field_model.num_gaussians
+        return {
+            "contrib": torch.ones(n, dtype=torch.float32),
+            "hits": torch.ones(n, dtype=torch.float32),
+            "transmittance": torch.ones(n, dtype=torch.float32),
+            "residual": torch.zeros(n, dtype=torch.float32),
+            "error_map": torch.zeros(n, 1, dtype=torch.float32),
+        }
+
+    def fake_apply_density_control(field_model, _cfg, step: int, **_kwargs) -> DensityControlResult:
+        return DensityControlResult(
+            ran=True,
+            changed=True,
+            pruned=0,
+            split=0,
+            cloned=0,
+            before=field_model.num_gaussians,
+            after=field_model.num_gaussians,
+            debug=None,
+        )
+
+    monkeypatch.setattr(pipeline, "_run_projection_preflight", fake_projection_preflight)
+    monkeypatch.setattr(pipeline, "render_with_pose", fake_render_with_pose)
+    monkeypatch.setattr(pipeline, "_training_view_forward", fake_training_view_forward)
+    monkeypatch.setattr(pipeline, "_observe_and_photometric_loss", fake_observe_and_photometric_loss)
+    monkeypatch.setattr(pipeline, "_regularization_impl", fake_regularization)
+    monkeypatch.setattr(pipeline, "_render_stats_from_prepared", fake_render_stats_from_prepared)
+    monkeypatch.setattr(pipeline_module, "apply_density_control", fake_apply_density_control)
+    monkeypatch.setattr(pipeline_module, "should_run_density_control_for_stage", lambda *_args, **_kwargs: True)
+
+    with pytest.raises(pipeline_module.ProjectionPreflightError, match="unsafe after density"):
+        pipeline.fit(images)
+
+    assert preflight_reasons == ["stage_entry", "post_density"]

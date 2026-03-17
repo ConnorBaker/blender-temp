@@ -1,5 +1,7 @@
 import gc
+from collections import deque
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 import time
 import warnings
 from pathlib import Path
@@ -24,14 +26,17 @@ from .observation_model import observation_render_size, render_observe_rgb
 from .posefree_config import PoseFreeGaussianConfig, TrainConfig
 from .progress_logging import emit_progress_event
 from .warp_gsplat_contracts import RasterConfig
-from .warp_gsplat_renderer import (
+from .gsplat_renderer import (
     PreparedVisibility,
-    clear_warp_launch_cache,
-    render_visibility_meta_warp,
-    render_stats_prepared_warp,
-    render_stats_warp,
-    render_values_warp,
+    clear_renderer_caches,
+    reserve_renderer_intersection_capacity,
+    render_projection_meta,
+    render_visibility_meta,
+    render_stats_prepared,
+    render_stats,
+    render_values,
 )
+
 
 _META_STAT_KEYS = (
     "meta_gaussian_count",
@@ -51,6 +56,14 @@ class NonFiniteTrainingError(FloatingPointError):
     def __init__(self, payload: dict[str, object]) -> None:
         self.payload = payload
         super().__init__(f"Non-finite state detected: {payload}")
+
+
+@dataclass(frozen=True)
+class ProjectionPreflightError(RuntimeError):
+    payload: dict[str, object]
+
+    def __post_init__(self) -> None:
+        RuntimeError.__init__(self, str(self.payload.get("message", "Projection preflight failed.")))
 
 
 def set_torch_compile_enabled(enabled: bool) -> None:
@@ -133,6 +146,124 @@ def _make_optional_compiled(callable_obj, name: str):
             return callable_obj(*args, **kwargs)
 
     return wrapped
+
+
+def _should_clear_renderer_cache(backend: str) -> bool:
+    return str(backend) == "warp"
+
+
+def _ordinary_step_view_batch_size(train_cfg: TrainConfig, num_views: int) -> int:
+    if num_views <= 0:
+        return 0
+    explicit_batch = int(train_cfg.view_batch_size)
+    if explicit_batch > 0:
+        return min(num_views, explicit_batch)
+    if num_views <= 4:
+        return num_views
+    configured_batch = int(getattr(train_cfg, "ordinary_step_view_batch", 0))
+    if configured_batch > 0:
+        return min(num_views, configured_batch)
+    return 4
+
+
+def _round_robin_view_ids(num_views: int, batch_size: int, step_seed: int) -> list[int]:
+    if num_views <= 0:
+        return []
+    batch = max(1, min(num_views, int(batch_size)))
+    if batch == num_views:
+        return list(range(num_views))
+    start = (int(step_seed) * batch) % num_views
+    return [int((start + offset) % num_views) for offset in range(batch)]
+
+
+def _final_stage_microbatch_size(train_cfg: TrainConfig, views_in_step: int) -> int:
+    if views_in_step <= 0:
+        return 1
+    configured = int(getattr(train_cfg, "final_stage_views_per_microbatch", 0))
+    if configured <= 0:
+        configured = 2
+    return max(1, min(views_in_step, configured))
+
+
+def _density_event_is_stable_for_freeze(
+    density_event: DensityControlResult,
+    cfg,
+) -> bool:
+    if not density_event.ran:
+        return False
+    debug = density_event.debug_dict()
+    if debug.get("weak_view_indices") or debug.get("reseed_view_indices"):
+        return False
+    visible_fraction = [float(value) for value in debug.get("visible_fraction_of_best", [])]
+    intersection_fraction = [float(value) for value in debug.get("intersection_fraction_of_best", [])]
+    if not visible_fraction or not intersection_fraction:
+        return False
+    return min(visible_fraction) >= float(cfg.freeze_min_visible_fraction) and min(intersection_fraction) >= float(
+        cfg.freeze_min_intersection_fraction
+    )
+
+
+def _effective_stage_steps(train_cfg: TrainConfig, stage_idx: int, total_stages: int) -> int:
+    steps = int(train_cfg.steps_per_stage[stage_idx])
+    if stage_idx == (total_stages - 1):
+        final_stage_max_steps = int(getattr(train_cfg, "final_stage_max_steps", 0))
+        if final_stage_max_steps > 0:
+            steps = min(steps, final_stage_max_steps)
+    return steps
+
+
+def _should_early_stop_final_stage(
+    train_cfg: TrainConfig,
+    loss_window: deque[float],
+    *,
+    step_index: int,
+    density_frozen: bool,
+) -> bool:
+    patience = int(getattr(train_cfg, "final_stage_early_stop_patience", 0))
+    if patience <= 0:
+        return False
+    if not density_frozen:
+        return False
+    min_step = int(getattr(train_cfg, "final_stage_early_stop_min_step", 0))
+    if (step_index + 1) < min_step:
+        return False
+    if len(loss_window) < patience:
+        return False
+    loss_delta = float(getattr(train_cfg, "final_stage_early_stop_loss_delta", 0.0))
+    return (max(loss_window) - min(loss_window)) <= loss_delta
+
+
+def _format_projection_preflight_message(
+    *,
+    reason: str,
+    stage_index: int,
+    step_index: int,
+    global_step: int,
+    record: dict[str, object],
+) -> str:
+    estimated_sort_buffer_bytes = int(record["estimated_sort_buffer_bytes"])
+    budget = record.get("sort_buffer_budget_bytes")
+    estimated_gib = float(estimated_sort_buffer_bytes) / float(1024**3)
+    budget_text = "unbounded"
+    if budget is not None:
+        budget_int = int(budget)
+        budget_text = f"{budget_int} ({float(budget_int) / float(1024**3):.2f} GiB)"
+    reason_text = "stage entry" if reason == "stage_entry" else "post-density"
+    step_text = "stage start" if step_index < 0 else f"step {step_index + 1}"
+    return (
+        f"Projection preflight failed during {reason_text}: stage {stage_index + 1}, {step_text}, "
+        f"global_step={global_step}, view={int(record['view_index'])}, "
+        f"render={int(record['render_width'])}x{int(record['render_height'])}, "
+        f"N={int(record['gaussian_count'])}, visible={int(record['visible_count'])}, "
+        f"M={int(record['intersection_count'])}, sort_mode={record['sort_mode']}, "
+        f"estimated_sort_bytes={estimated_sort_buffer_bytes} ({estimated_gib:.2f} GiB), "
+        f"budget={budget_text}. "
+        "Recommended fixes, in order: "
+        "1) lower projected footprint with `radius_clip_px`; "
+        "2) reduce initial or learned scale growth; "
+        "3) freeze or prune before the next stage or after density growth; "
+        "4) only then increase `anchor_stride`."
+    )
 
 
 class PoseFreeGaussianSR(nn.Module):
@@ -257,11 +388,8 @@ class PoseFreeGaussianSR(nn.Module):
         survivor_sources: Tensor | None,
         appended_count: int,
     ) -> torch.optim.Optimizer:
-        del old_opt, survivor_sources, appended_count
-        # Density events change the geometry distribution abruptly enough that reusing Adam moments across any
-        # parameter group can poison subsequent steps. A fresh optimizer is stable on the saved density checkpoints,
-        # so reset all groups here rather than carrying stale state through the topology change.
-        return self._make_optimizer(train_cfg)
+        del train_cfg, survivor_sources, appended_count
+        return old_opt
 
     def _scale_intrinsics(self, out_h: int, out_w: int) -> Tensor:
         scale_x = out_w / self.train_width
@@ -271,6 +399,7 @@ class PoseFreeGaussianSR(nn.Module):
     def _renderer_config(self) -> RasterConfig:
         render_cfg = self.config.render
         return RasterConfig(
+            backend=render_cfg.backend,
             tile_size=render_cfg.tile_size,
             near_plane=render_cfg.near,
             far_plane=render_cfg.far,
@@ -280,7 +409,10 @@ class PoseFreeGaussianSR(nn.Module):
             rasterize_mode="antialiased" if render_cfg.antialiased_opacity else "classic",
             alpha_min=render_cfg.alpha_threshold,
             transmittance_eps=render_cfg.transmittance_threshold,
+            backward_impl=render_cfg.backward_impl,
             background_rgb=render_cfg.bg_color,
+            helion_static_shapes=render_cfg.helion_static_shapes,
+            helion_runtime_autotune=render_cfg.helion_runtime_autotune,
         )
 
     def _viewmat_from_pose(self, R_cw: Tensor, t_cw: Tensor) -> Tensor:
@@ -325,9 +457,14 @@ class PoseFreeGaussianSR(nn.Module):
             and rgb is not None
             and latent is not None
         )
+        active_count = (
+            int(field.get("active_count", means3d.shape[0]).item())
+            if field.get("active_count") is not None
+            else int(means3d.shape[0])
+        )
         values = self._packed_values(rgb, latent)
         background = self._packed_background(values.device, values.dtype)
-        return viewmat, K, means3d, quat, scale, opacity, values, background
+        return viewmat, K, means3d, quat, scale, opacity, values, background, active_count
 
     def _prepare_render_payload_eager(
         self,
@@ -336,14 +473,14 @@ class PoseFreeGaussianSR(nn.Module):
         R_cw: Tensor,
         t_cw: Tensor,
     ):
-        field = self.field_model(base_intrinsics, R_cw=R_cw, t_cw=t_cw)
-        viewmat, K, means3d, quat, scale, opacity, values, background = self._render_inputs(
+        field = self.field_model(base_intrinsics, R_cw=R_cw, t_cw=t_cw, padded=True)
+        viewmat, K, means3d, quat, scale, opacity, values, background, active_count = self._render_inputs(
             field,
             R_cw,
             t_cw,
             render_intrinsics,
         )
-        return field, viewmat, K, means3d, quat, scale, opacity, values, background
+        return field, viewmat, K, means3d, quat, scale, opacity, values, background, active_count
 
     def _render_stats_with_pose(
         self,
@@ -355,10 +492,10 @@ class PoseFreeGaussianSR(nn.Module):
         out_w: int,
         residual_map: Tensor | None = None,
     ) -> dict[str, Tensor]:
-        viewmat, K, means3d, quat, scale, opacity, values, background = self._render_inputs(
+        viewmat, K, means3d, quat, scale, opacity, values, background, active_count = self._render_inputs(
             field, R_cw, t_cw, intrinsics
         )
-        return render_stats_warp(
+        return render_stats(
             means=means3d.contiguous(),
             quat=quat.contiguous(),
             scale=scale.contiguous(),
@@ -369,6 +506,7 @@ class PoseFreeGaussianSR(nn.Module):
             height=out_h,
             cfg=self._renderer_config(),
             residual_map=None if residual_map is None else residual_map.contiguous(),
+            active_count=active_count,
         )
 
     def _render_stats_from_prepared(
@@ -377,11 +515,12 @@ class PoseFreeGaussianSR(nn.Module):
         opacity: Tensor,
         residual_map: Tensor | None = None,
     ) -> dict[str, Tensor]:
-        return render_stats_prepared_warp(
+        return render_stats_prepared(
             prepared,
             opacity=opacity.contiguous(),
             cfg=self._renderer_config(),
             residual_map=None if residual_map is None else residual_map.contiguous(),
+            active_count=prepared.gaussian_count,
         )
 
     def _meta_tuple(self, meta: dict[str, Tensor]) -> tuple[Tensor, ...]:
@@ -405,8 +544,9 @@ class PoseFreeGaussianSR(nn.Module):
         K: Tensor,
         out_h: int,
         out_w: int,
+        active_count: int,
     ) -> tuple[Tensor, PreparedVisibility, tuple[Tensor, ...]]:
-        packed_hwc, prepared = render_values_warp(
+        packed_hwc, prepared = render_values(
             means=means.contiguous(),
             quat=quat.contiguous(),
             scale=scale.contiguous(),
@@ -419,6 +559,7 @@ class PoseFreeGaussianSR(nn.Module):
             height=out_h,
             cfg=self._renderer_config(),
             return_prepared=True,
+            active_count=active_count,
         )
         return packed_hwc, prepared, self._meta_tuple(prepared.meta())
 
@@ -428,11 +569,12 @@ class PoseFreeGaussianSR(nn.Module):
         opacity: Tensor,
         residual_map: Tensor,
     ) -> tuple[Tensor, ...]:
-        stats = render_stats_prepared_warp(
+        stats = render_stats_prepared(
             prepared,
             opacity=opacity.contiguous(),
             cfg=self._renderer_config(),
             residual_map=residual_map.contiguous(),
+            active_count=prepared.gaussian_count,
         )
         return tuple(stats[key].detach() for key in _DENSITY_STAT_KEYS)
 
@@ -496,11 +638,13 @@ class PoseFreeGaussianSR(nn.Module):
         out_h: int,
         out_w: int,
     ) -> tuple[Tensor, ...]:
-        _field, viewmat, K, means3d, quat, scale, opacity, values, background = self._prepare_render_payload(
-            base_intrinsics,
-            render_intrinsics,
-            R_cw,
-            t_cw,
+        _field, viewmat, K, means3d, quat, scale, opacity, values, background, active_count = (
+            self._prepare_render_payload(
+                base_intrinsics,
+                render_intrinsics,
+                R_cw,
+                t_cw,
+            )
         )
         packed_hwc, _prepared, meta = self._render_values_with_meta(
             means3d,
@@ -513,6 +657,7 @@ class PoseFreeGaussianSR(nn.Module):
             K,
             out_h,
             out_w,
+            active_count,
         )
         packed = packed_hwc.permute(2, 0, 1).contiguous()
         rgb, _latent, _alpha = self._postprocess_rgb(packed, out_h, out_w)
@@ -529,11 +674,13 @@ class PoseFreeGaussianSR(nn.Module):
         out_h: int,
         out_w: int,
     ) -> tuple[Tensor, ...]:
-        _field, viewmat, K, means3d, quat, scale, opacity, values, background = self._prepare_render_payload(
-            base_intrinsics,
-            render_intrinsics,
-            R_cw,
-            t_cw,
+        _field, viewmat, K, means3d, quat, scale, opacity, values, background, active_count = (
+            self._prepare_render_payload(
+                base_intrinsics,
+                render_intrinsics,
+                R_cw,
+                t_cw,
+            )
         )
         packed_hwc, prepared, meta = self._render_values_with_meta(
             means3d,
@@ -546,6 +693,7 @@ class PoseFreeGaussianSR(nn.Module):
             K,
             out_h,
             out_w,
+            active_count,
         )
         packed = packed_hwc.permute(2, 0, 1).contiguous()
         rgb, _latent, _alpha = self._postprocess_rgb(packed, out_h, out_w)
@@ -664,11 +812,13 @@ class PoseFreeGaussianSR(nn.Module):
             self._sync_for_timing(timing_device)
             t0 = time.perf_counter()
         with torch.profiler.record_function("pipeline.render.prepare_field"):
-            field, viewmat, K, means3d, quat, scale, opacity, values, background = self._prepare_render_payload(
-                base_intr,
-                intr,
-                R_cw,
-                t_cw,
+            field, viewmat, K, means3d, quat, scale, opacity, values, background, active_count = (
+                self._prepare_render_payload(
+                    base_intr,
+                    intr,
+                    R_cw,
+                    t_cw,
+                )
             )
         means_render = means3d.contiguous()
         quat_render = quat.contiguous()
@@ -684,7 +834,7 @@ class PoseFreeGaussianSR(nn.Module):
             t0 = time.perf_counter()
         renderer_cfg = self._renderer_config()
         with torch.profiler.record_function("pipeline.render.warp"):
-            render_result = render_values_warp(
+            render_result = render_values(
                 means=means_render,
                 quat=quat_render,
                 scale=scale_render,
@@ -697,6 +847,7 @@ class PoseFreeGaussianSR(nn.Module):
                 height=out_h,
                 cfg=renderer_cfg,
                 return_prepared=return_aux,
+                active_count=active_count,
             )
         if return_aux:
             packed_hwc, prepared = render_result
@@ -720,7 +871,12 @@ class PoseFreeGaussianSR(nn.Module):
                 if stats_mode == "meta":
                     render_stats = prepared.meta()
                 else:
-                    render_stats = render_stats_prepared_warp(prepared, opacity=opacity_render, cfg=renderer_cfg)
+                    render_stats = render_stats_prepared(
+                        prepared,
+                        opacity=opacity_render,
+                        cfg=renderer_cfg,
+                        active_count=active_count,
+                    )
             if profile:
                 self._sync_for_timing(timing_device)
                 aux_stats_s = time.perf_counter() - t0
@@ -783,7 +939,7 @@ class PoseFreeGaussianSR(nn.Module):
         base_intrinsics = self.intrinsics.get()
         render_intrinsics = self._scale_intrinsics(out_h, out_w)
         R_all, t_all = self.camera_model.world_to_camera()
-        _field, viewmat, K, means3d, quat, scale_render, _opacity, _values, _background = (
+        _field, viewmat, K, means3d, quat, scale_render, _opacity, _values, _background, active_count = (
             self._prepare_render_payload_eager(
                 base_intrinsics,
                 render_intrinsics,
@@ -791,7 +947,7 @@ class PoseFreeGaussianSR(nn.Module):
                 t_all[view_index],
             )
         )
-        return render_visibility_meta_warp(
+        return render_visibility_meta(
             means=means3d.contiguous(),
             quat=quat.contiguous(),
             scale=scale_render.contiguous(),
@@ -800,7 +956,179 @@ class PoseFreeGaussianSR(nn.Module):
             width=out_w,
             height=out_h,
             cfg=self._renderer_config(),
+            active_count=active_count,
         )
+
+    def _projection_preflight_for_views(
+        self,
+        view_ids: Sequence[int],
+        render_h: int,
+        render_w: int,
+    ) -> list[dict[str, object]]:
+        base_intrinsics = self.intrinsics.get()
+        render_intrinsics = self._scale_intrinsics(render_h, render_w)
+        R_all, t_all = self.camera_model.world_to_camera()
+        renderer_cfg = self._renderer_config()
+        records: list[dict[str, object]] = []
+        for view_index in view_ids:
+            _field, viewmat, K, means3d, quat, scale_render, _opacity, _values, _background, active_count = (
+                self._prepare_render_payload_eager(
+                    base_intrinsics,
+                    render_intrinsics,
+                    R_all[view_index],
+                    t_all[view_index],
+                )
+            )
+            meta = render_projection_meta(
+                means=means3d.contiguous(),
+                quat=quat.contiguous(),
+                scale=scale_render.contiguous(),
+                viewmat=viewmat.contiguous(),
+                K=K.contiguous(),
+                width=render_w,
+                height=render_h,
+                cfg=renderer_cfg,
+                active_count=active_count,
+            )
+            records.append({
+                "view_index": int(view_index),
+                **meta,
+            })
+        return records
+
+    def _run_projection_preflight(
+        self,
+        *,
+        view_ids: Sequence[int],
+        render_h: int,
+        render_w: int,
+        stage_index: int,
+        step_index: int,
+        global_step: int,
+        reason: str,
+        progress_event_callback: Callable[[dict], None] | None = None,
+        fail_on_error: bool,
+    ) -> dict[str, object]:
+        if not self.field_model.means3d.is_cuda:
+            records = [
+                {
+                    "view_index": int(view_index),
+                    "gaussian_count": int(self.field_model.num_gaussians),
+                    "visible_count": 0,
+                    "intersection_count": 0,
+                    "tile_count": 0,
+                    "tiles_x": 0,
+                    "tiles_y": 0,
+                    "render_width": int(render_w),
+                    "render_height": int(render_h),
+                    "sort_mode": "cpu_skip",
+                    "estimated_sort_buffer_bytes": 0,
+                    "sort_buffer_budget_bytes": 0,
+                    "sort_buffer_within_budget": True,
+                }
+                for view_index in view_ids
+            ]
+            summary = {
+                "reason": reason,
+                "stage_index": int(stage_index),
+                "step_index": int(step_index),
+                "global_step": int(global_step),
+                "render_height": int(render_h),
+                "render_width": int(render_w),
+                "unsafe_view_count": 0,
+                "worst_view_index": int(records[0]["view_index"]) if records else -1,
+                "max_intersection_count": 0,
+                "max_estimated_sort_buffer_bytes": 0,
+                "all_within_budget": True,
+                "views": records,
+            }
+            return summary
+        records = self._projection_preflight_for_views(view_ids, render_h, render_w)
+        unsafe_records = [record for record in records if not bool(record["sort_buffer_within_budget"])]
+        worst_record = max(records, key=lambda record: int(record["estimated_sort_buffer_bytes"]))
+        summary = {
+            "reason": reason,
+            "stage_index": int(stage_index),
+            "step_index": int(step_index),
+            "global_step": int(global_step),
+            "render_height": int(render_h),
+            "render_width": int(render_w),
+            "unsafe_view_count": int(len(unsafe_records)),
+            "worst_view_index": int(worst_record["view_index"]),
+            "max_intersection_count": int(worst_record["intersection_count"]),
+            "max_estimated_sort_buffer_bytes": int(worst_record["estimated_sort_buffer_bytes"]),
+            "all_within_budget": bool(not unsafe_records),
+            "views": records,
+        }
+        for record in records:
+            emit_progress_event(
+                {
+                    "event": "projection_preflight",
+                    "reason": reason,
+                    "stage_index": int(stage_index),
+                    "step_index": int(step_index),
+                    "global_step": int(global_step),
+                    **record,
+                },
+                callback=progress_event_callback,
+            )
+        if unsafe_records and fail_on_error:
+            offending = max(unsafe_records, key=lambda record: int(record["estimated_sort_buffer_bytes"]))
+            raise ProjectionPreflightError({
+                "reason": reason,
+                "stage_index": int(stage_index),
+                "step_index": int(step_index),
+                "global_step": int(global_step),
+                "record": offending,
+                "message": _format_projection_preflight_message(
+                    reason=reason,
+                    stage_index=stage_index,
+                    step_index=step_index,
+                    global_step=global_step,
+                    record=offending,
+                ),
+            })
+        return summary
+
+    def _reserve_helion_intersection_capacity_from_preflight(self, summary: dict[str, object]) -> None:
+        if str(self.config.render.backend) != "helion":
+            return
+        required_count = int(summary.get("max_intersection_count", 0))
+        if required_count <= 0:
+            return
+        reserve_renderer_intersection_capacity(
+            backend="helion",
+            device=self.field_model.means3d.device,
+            width=int(summary["render_width"]),
+            height=int(summary["render_height"]),
+            required_count=required_count,
+        )
+
+    def preflight_training_stages(self) -> list[dict[str, object]]:
+        results: list[dict[str, object]] = []
+        if _should_clear_renderer_cache(self.config.render.backend):
+            clear_renderer_caches(backend=self.config.render.backend)
+        total_stages = len(self.config.train.stage_scales)
+        for stage_idx, stage_scale in enumerate(self.config.train.stage_scales):
+            stage_h = max(1, int(round(self.train_height * float(stage_scale))))
+            stage_w = max(1, int(round(self.train_width * float(stage_scale))))
+            render_h, render_w = observation_render_size(stage_h, stage_w, self.config.observation)
+            summary = self._run_projection_preflight(
+                view_ids=list(range(self.num_views)),
+                render_h=render_h,
+                render_w=render_w,
+                stage_index=stage_idx,
+                step_index=-1,
+                global_step=-1,
+                reason="manual_preflight",
+                progress_event_callback=None,
+                fail_on_error=False,
+            )
+            self._reserve_helion_intersection_capacity_from_preflight(summary)
+            summary["stage_scale"] = float(stage_scale)
+            summary["total_stages"] = int(total_stages)
+            results.append(summary)
+        return results
 
     def _photometric_loss(self, pred: Tensor, target: Tensor) -> Tensor:
         l1 = charbonnier(pred - target).mean()
@@ -1048,11 +1376,19 @@ class PoseFreeGaussianSR(nn.Module):
         for stage_idx, stage_scale in enumerate(train_cfg.stage_scales):
             if stage_idx < resume_stage_index:
                 continue
-            steps = train_cfg.steps_per_stage[stage_idx]
+            is_final_stage = stage_idx == (total_stages - 1)
+            final_stage_density_stable_events = 0
+            final_stage_density_frozen = False
+            steps = _effective_stage_steps(train_cfg, stage_idx, total_stages)
             step_start_index = max(0, resume_step_index + 1) if stage_idx == resume_stage_index else 0
             if step_start_index >= int(steps):
                 continue
-            clear_warp_launch_cache()
+            final_stage_loss_window: deque[float] = deque(
+                maxlen=max(1, int(getattr(train_cfg, "final_stage_early_stop_patience", 0)))
+            )
+            final_stage_early_stopped = False
+            if _should_clear_renderer_cache(self.config.render.backend):
+                clear_renderer_caches(backend=self.config.render.backend)
             stage_h = max(1, int(round(self.train_height * float(stage_scale))))
             stage_w = max(1, int(round(self.train_width * float(stage_scale))))
             render_h, render_w = observation_render_size(stage_h, stage_w, self.config.observation)
@@ -1062,6 +1398,18 @@ class PoseFreeGaussianSR(nn.Module):
                 else torch.nn.functional.interpolate(images, size=(stage_h, stage_w), mode="area")
             )
             stage_alpha = 0.0 if total_stages == 1 else stage_idx / (total_stages - 1)
+            stage_preflight = self._run_projection_preflight(
+                view_ids=list(range(self.num_views)),
+                render_h=render_h,
+                render_w=render_w,
+                stage_index=stage_idx,
+                step_index=-1,
+                global_step=global_step,
+                reason="stage_entry",
+                progress_event_callback=progress_event_callback,
+                fail_on_error=True,
+            )
+            self._reserve_helion_intersection_capacity_from_preflight(stage_preflight)
             stage_start_time = time.perf_counter()
 
             _emit_progress({
@@ -1076,12 +1424,19 @@ class PoseFreeGaussianSR(nn.Module):
                 "render_height": int(render_h),
                 "render_width": int(render_w),
                 "num_gaussians": int(self.field_model.num_gaussians),
+                "preflight_unsafe_view_count": int(stage_preflight["unsafe_view_count"]),
+                "preflight_worst_view_index": int(stage_preflight["worst_view_index"]),
+                "preflight_max_intersection_count": int(stage_preflight["max_intersection_count"]),
+                "preflight_max_estimated_sort_buffer_bytes": int(stage_preflight["max_estimated_sort_buffer_bytes"]),
             })
             if verbose_progress:
                 self._progress_print(
                     f"[stage-start] stage={stage_idx + 1}/{total_stages} scale={stage_scale:.2f} "
                     f"stage={stage_h}x{stage_w} render={render_h}x{render_w} "
-                    f"N={self.field_model.num_gaussians}"
+                    f"N={self.field_model.num_gaussians} "
+                    f"preflight_worst_view={int(stage_preflight['worst_view_index'])} "
+                    f"preflight_max_M={int(stage_preflight['max_intersection_count'])} "
+                    f"preflight_sort={float(int(stage_preflight['max_estimated_sort_buffer_bytes'])) / float(1024**3):.2f}GiB"
                     + (
                         f" resume_step={step_start_index + 1}"
                         if stage_idx == resume_stage_index and step_start_index > 0
@@ -1094,24 +1449,25 @@ class PoseFreeGaussianSR(nn.Module):
                     step_start_time = time.perf_counter()
                     if not timing_enabled:
                         self._cudagraph_mark_step_begin()
-                    density_due = should_run_density_control_for_stage(
+                    density_scheduled = should_run_density_control_for_stage(
                         global_step,
                         self.config.density,
                         stage_idx,
                         total_stages,
                     )
+                    density_due = bool(density_scheduled and not (is_final_stage and final_stage_density_frozen))
                     R_all, t_all = self.camera_model.world_to_camera()
-                    if train_cfg.view_batch_size and train_cfg.view_batch_size < self.num_views:
-                        perm = torch.randperm(self.num_views, device=images.device)
-                        view_ids = perm[: train_cfg.view_batch_size].tolist()
-                    else:
+                    if density_due:
                         view_ids = list(range(self.num_views))
+                    else:
+                        ordinary_batch = _ordinary_step_view_batch_size(train_cfg, self.num_views)
+                        view_ids = _round_robin_view_ids(self.num_views, ordinary_batch, global_step)
+                    final_stage_microbatch = (
+                        _final_stage_microbatch_size(train_cfg, len(view_ids)) if is_final_stage else 1
+                    )
                     full_view_batch = len(view_ids) == self.num_views
                     use_compiled_train_step = bool(
-                        not debug_progress_enabled
-                        and not timing_enabled
-                        and full_view_batch
-                        and stage_idx != (total_stages - 1)
+                        not debug_progress_enabled and not timing_enabled and full_view_batch and not is_final_stage
                     )
 
                     _emit_progress({
@@ -1121,9 +1477,12 @@ class PoseFreeGaussianSR(nn.Module):
                         "global_step": int(global_step),
                         "steps_in_stage": int(steps),
                         "views_in_step": int(len(view_ids)),
+                        "view_microbatch_size": int(final_stage_microbatch),
                         "render_height": int(render_h),
                         "render_width": int(render_w),
                         "density_due": bool(density_due),
+                        "density_scheduled": bool(density_scheduled),
+                        "density_frozen": bool(final_stage_density_frozen),
                         "num_gaussians": int(self.field_model.num_gaussians),
                     })
                     if verbose_progress:
@@ -1131,7 +1490,9 @@ class PoseFreeGaussianSR(nn.Module):
                             f"[step-start] stage={stage_idx + 1}/{total_stages} "
                             f"step={step + 1}/{steps} global={global_step} "
                             f"views={len(view_ids)} render={render_h}x{render_w} "
-                            f"N={self.field_model.num_gaussians} density_due={int(density_due)}"
+                            f"N={self.field_model.num_gaussians} density_due={int(density_due)} "
+                            f"density_frozen={int(final_stage_density_frozen)} "
+                            f"microbatch={final_stage_microbatch}"
                         )
 
                     photo_loss = images.new_tensor(0.0)
@@ -1145,6 +1506,8 @@ class PoseFreeGaussianSR(nn.Module):
                     view_total_s = 0.0
                     backward_s = 0.0
                     opt_step_s = 0.0
+                    final_stage_photo_microbatch = images.new_tensor(0.0) if is_final_stage else None
+                    final_stage_photo_count = 0
 
                     if use_compiled_train_step and not density_due:
                         with torch.profiler.record_function("pipeline.train_step_compiled"):
@@ -1234,10 +1597,19 @@ class PoseFreeGaussianSR(nn.Module):
                                                 "view_ordinal": int(view_pos),
                                             },
                                         )
-                                    if stage_idx == (total_stages - 1):
+                                    if is_final_stage:
                                         photo_loss = photo_loss + photo_term.detach()
-                                        with torch.profiler.record_function("pipeline.photo_backward"):
-                                            (photo_term / max(len(view_ids), 1)).backward()
+                                        assert final_stage_photo_microbatch is not None
+                                        final_stage_photo_microbatch = final_stage_photo_microbatch + photo_term
+                                        final_stage_photo_count += 1
+                                        if (
+                                            final_stage_photo_count >= final_stage_microbatch
+                                            or view_pos == len(view_ids) - 1
+                                        ):
+                                            with torch.profiler.record_function("pipeline.photo_backward"):
+                                                (final_stage_photo_microbatch / max(len(view_ids), 1)).backward()
+                                            final_stage_photo_microbatch = images.new_tensor(0.0)
+                                            final_stage_photo_count = 0
                                     else:
                                         photo_loss = photo_loss + photo_term
                                     render_profile = (
@@ -1348,10 +1720,19 @@ class PoseFreeGaussianSR(nn.Module):
                                                 "view_ordinal": int(view_pos),
                                             },
                                         )
-                                    if stage_idx == (total_stages - 1):
+                                    if is_final_stage:
                                         photo_loss = photo_loss + photo_term.detach()
-                                        with torch.profiler.record_function("pipeline.photo_backward"):
-                                            (photo_term / max(len(view_ids), 1)).backward()
+                                        assert final_stage_photo_microbatch is not None
+                                        final_stage_photo_microbatch = final_stage_photo_microbatch + photo_term
+                                        final_stage_photo_count += 1
+                                        if (
+                                            final_stage_photo_count >= final_stage_microbatch
+                                            or view_pos == len(view_ids) - 1
+                                        ):
+                                            with torch.profiler.record_function("pipeline.photo_backward"):
+                                                (final_stage_photo_microbatch / max(len(view_ids), 1)).backward()
+                                            final_stage_photo_microbatch = images.new_tensor(0.0)
+                                            final_stage_photo_count = 0
                                     else:
                                         photo_loss = photo_loss + photo_term
                                     render_summary = self._render_stats_summary(
@@ -1421,9 +1802,7 @@ class PoseFreeGaussianSR(nn.Module):
                             self._raise_nonfinite("photo_loss", stage_idx, step, global_step)
                         if not torch.isfinite(reg_loss):
                             self._raise_nonfinite("reg_loss", stage_idx, step, global_step)
-                        loss = (
-                            photo_loss + reg_loss.detach() if stage_idx == (total_stages - 1) else photo_loss + reg_loss
-                        )
+                        loss = photo_loss + reg_loss.detach() if is_final_stage else photo_loss + reg_loss
                         if not torch.isfinite(loss):
                             self._raise_nonfinite("loss", stage_idx, step, global_step)
 
@@ -1432,14 +1811,14 @@ class PoseFreeGaussianSR(nn.Module):
                             self._sync_for_timing(images.device)
                             backward_start = time.perf_counter()
                         with torch.profiler.record_function("pipeline.backward"):
-                            if stage_idx == (total_stages - 1):
+                            if is_final_stage:
                                 reg_loss.backward()
                             else:
                                 loss.backward()
                         if timing_enabled:
                             self._sync_for_timing(images.device)
                             backward_s = time.perf_counter() - backward_start
-                        if stage_idx == (total_stages - 1):
+                        if is_final_stage:
                             for param in self.camera_model.parameters():
                                 param.grad = None
                         if train_cfg.grad_clip > 0:
@@ -1517,7 +1896,8 @@ class PoseFreeGaussianSR(nn.Module):
                             )
                         density_s = time.perf_counter() - density_start
                     if density_event.changed:
-                        clear_warp_launch_cache()
+                        if _should_clear_renderer_cache(self.config.render.backend):
+                            clear_renderer_caches(backend=self.config.render.backend)
                         self.field_model.enforce_scale_floor()
                         opt = self._rebuild_optimizer_after_density(
                             opt,
@@ -1528,6 +1908,23 @@ class PoseFreeGaussianSR(nn.Module):
                         self._debug_optimizer = opt
                     if density_event.ran:
                         density_summary = density_event.debug_dict()
+                        if is_final_stage and int(self.config.density.freeze_after_stable_events) > 0:
+                            if _density_event_is_stable_for_freeze(density_event, self.config.density):
+                                final_stage_density_stable_events += 1
+                            else:
+                                final_stage_density_stable_events = 0
+                            if not final_stage_density_frozen and final_stage_density_stable_events >= int(
+                                self.config.density.freeze_after_stable_events
+                            ):
+                                final_stage_density_frozen = True
+                                _emit_progress({
+                                    "event": "density_frozen",
+                                    "stage_index": int(stage_idx),
+                                    "step_index": int(step),
+                                    "global_step": int(global_step),
+                                    "stable_events": int(final_stage_density_stable_events),
+                                    "num_gaussians": int(self.field_model.num_gaussians),
+                                })
                         event_record = {
                             "global_step": int(global_step),
                             "stage_index": int(stage_idx),
@@ -1555,6 +1952,19 @@ class PoseFreeGaussianSR(nn.Module):
                             jsonl_path=density_event_log_path,
                             callback=density_event_callback,
                         )
+                    if density_event.changed:
+                        post_density_preflight = self._run_projection_preflight(
+                            view_ids=list(range(self.num_views)),
+                            render_h=render_h,
+                            render_w=render_w,
+                            stage_index=stage_idx,
+                            step_index=step,
+                            global_step=global_step,
+                            reason="post_density",
+                            progress_event_callback=progress_event_callback,
+                            fail_on_error=True,
+                        )
+                        self._reserve_helion_intersection_capacity_from_preflight(post_density_preflight)
 
                     step_total_s = time.perf_counter() - step_start_time
                     stage_elapsed_s = time.perf_counter() - stage_start_time
@@ -1570,6 +1980,10 @@ class PoseFreeGaussianSR(nn.Module):
                         "render_width": int(render_w),
                         "steps_in_stage": int(steps),
                         "views_in_step": int(len(view_ids)),
+                        "view_microbatch_size": int(final_stage_microbatch),
+                        "density_due": bool(density_due),
+                        "density_scheduled": bool(density_scheduled),
+                        "density_frozen": bool(final_stage_density_frozen),
                         "loss": float(loss.detach().item()),
                         "photo_loss": float(photo_loss.detach().item()),
                         "reg_loss": float(reg_loss.detach().item()),
@@ -1609,6 +2023,8 @@ class PoseFreeGaussianSR(nn.Module):
                             f"photo={history['photo'][-1]:.6f}  "
                             f"reg={history['reg'][-1]:.6f}  "
                             f"N={self.field_model.num_gaussians}  "
+                            f"views_in_step={len(view_ids)}  "
+                            f"microbatch={final_stage_microbatch}  "
                             f"views={view_total_s:.2f}s(field={field_total_s:.2f}s render={render_total_s:.2f}s aux={aux_stats_total_s:.2f}s residual={residual_stats_total_s:.2f}s)  "
                             f"backward={backward_s:.2f}s  "
                             f"opt={opt_step_s:.2f}s  "
@@ -1637,7 +2053,32 @@ class PoseFreeGaussianSR(nn.Module):
                         )
                     if step_callback is not None:
                         step_callback(stage_idx, step, global_step)
+                    if is_final_stage:
+                        final_stage_loss_window.append(float(loss.detach().item()))
                     global_step += 1
+                    if is_final_stage and _should_early_stop_final_stage(
+                        train_cfg,
+                        final_stage_loss_window,
+                        step_index=step,
+                        density_frozen=final_stage_density_frozen,
+                    ):
+                        final_stage_early_stopped = True
+                        _emit_progress({
+                            "event": "final_stage_early_stop",
+                            "stage_index": int(stage_idx),
+                            "step_index": int(step),
+                            "global_step": int(global_step - 1),
+                            "stable_window": list(final_stage_loss_window),
+                            "num_gaussians": int(self.field_model.num_gaussians),
+                        })
+                        if verbose_progress:
+                            self._progress_print(
+                                f"[final-stage-early-stop] stage={stage_idx + 1}/{total_stages} "
+                                f"step={step + 1}/{steps} global={global_step - 1} "
+                                f"window={list(final_stage_loss_window)} "
+                                f"N={self.field_model.num_gaussians}"
+                            )
+                        break
 
             _emit_progress({
                 "event": "stage_end",
@@ -1646,6 +2087,7 @@ class PoseFreeGaussianSR(nn.Module):
                 "steps": int(steps),
                 "stage_elapsed_s": float(time.perf_counter() - stage_start_time),
                 "num_gaussians": int(self.field_model.num_gaussians),
+                "early_stopped": bool(final_stage_early_stopped),
             })
 
         return history

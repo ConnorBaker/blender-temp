@@ -5,9 +5,12 @@ import torch
 from blender_temp.cmd import main as main_module
 from blender_temp.cmd.main import (
     assess_run_safety,
+    build_anchor_stride_seed_table,
     configure_torch_compile_runtime,
     configure_tf32_backends,
+    estimate_initial_gaussian_count,
     fit_with_optional_pytorch_profiler,
+    format_seed_estimate_table,
     format_scale_tag,
     pytorch_profiler_schedule_kwargs,
     reset_run_logs,
@@ -31,6 +34,12 @@ def test_parser_accepts_disable_torch_compile_flag() -> None:
     args = setup_argparse().parse_args(["--input-dir", str(Path("/tmp")), "--disable-torch-compile"])
 
     assert args.disable_torch_compile is True
+
+
+def test_parser_accepts_preflight_only_flag() -> None:
+    args = setup_argparse().parse_args(["--input-dir", str(Path("/tmp")), "--preflight-only"])
+
+    assert args.preflight_only is True
 
 
 def test_format_scale_tag_strips_trailing_zeroes() -> None:
@@ -95,6 +104,33 @@ def test_assess_run_safety_accepts_full_batch_no_clip_run() -> None:
     )
 
     assert issues == []
+
+
+def test_estimate_initial_gaussian_count_matches_anchor_grid_math() -> None:
+    assert estimate_initial_gaussian_count(1080, 1920, 1) == 2_073_600
+    assert estimate_initial_gaussian_count(1080, 1920, 8) == 32_400
+    assert estimate_initial_gaussian_count(5, 7, 4) == 4
+
+
+def test_build_anchor_stride_seed_table_includes_current_stride_and_expected_counts() -> None:
+    rows = build_anchor_stride_seed_table(1080, 1920, 6, candidate_strides=(1, 2, 4, 8))
+
+    assert [row["anchor_stride"] for row in rows] == [1, 2, 4, 6, 8]
+    assert rows[0]["estimated_gaussians"] == 2_073_600
+    assert rows[1]["estimated_gaussians"] == 518_400
+    assert rows[2]["estimated_gaussians"] == 129_600
+    assert rows[3]["estimated_gaussians"] == 57_600
+    assert rows[4]["estimated_gaussians"] == 32_400
+
+
+def test_format_seed_estimate_table_is_human_readable() -> None:
+    text = format_seed_estimate_table([
+        {"anchor_stride": 1, "anchor_height": 1080, "anchor_width": 1920, "estimated_gaussians": 2_073_600},
+        {"anchor_stride": 8, "anchor_height": 135, "anchor_width": 240, "estimated_gaussians": 32_400},
+    ])
+
+    assert "stride=1 -> 2073600 (1080x1920)" in text
+    assert "stride=8 -> 32400 (135x240)" in text
 
 
 def test_reset_run_logs_removes_only_append_only_logs(tmp_path) -> None:

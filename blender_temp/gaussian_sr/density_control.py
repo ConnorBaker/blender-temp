@@ -248,12 +248,13 @@ def gradient_score(field_model: CanonicalGaussianField) -> Tensor:
     for param in (field_model.means3d, field_model.log_scale, field_model.opacity_logit):
         if param.grad is None:
             continue
-        score = score + param.grad.detach().reshape(n, -1).norm(dim=1)
+        score = score + param.grad.detach()[:n].reshape(n, -1).norm(dim=1)
     return score
 
 
 def scale_score(field_model: CanonicalGaussianField) -> Tensor:
-    return torch.exp(field_model.log_scale.detach()).amax(dim=1)
+    n = field_model.num_gaussians
+    return torch.exp(field_model.log_scale.detach()[:n]).amax(dim=1)
 
 
 def normalize_render_stats(
@@ -858,7 +859,7 @@ def _reseed_for_observation(
     intr = observation.intrinsics.detach()
     fx, fy, cx, cy = intr.unbind(dim=0)
 
-    means = field_model.means3d.detach()
+    means = field_model.means3d.detach()[: field_model.num_gaussians]
     cam_pts_all = means @ R_cw.transpose(0, 1) + t_cw.unsqueeze(0)
     cam_depths = cam_pts_all[:, 2]
     visible_mask = cam_depths > field_model.field_cfg.min_depth
@@ -936,7 +937,7 @@ def _reseed_for_observation(
         device=world_pts.device,
         dtype=torch.long,
     )
-    field_model.append_gaussians(
+    appended = field_model.append_gaussians(
         means3d=world_pts,
         rgb=rgb,
         uv=uv,
@@ -944,7 +945,7 @@ def _reseed_for_observation(
         opacity=opacity,
         protect_until_step=protect_until_step,
     )
-    return int(world_pts.shape[0])
+    return int(appended)
 
 
 def apply_density_control(
@@ -969,7 +970,7 @@ def apply_density_control(
     before = field_model.num_gaussians
     device = field_model.means3d.device
     dtype = field_model.means3d.dtype
-    opacity = torch.sigmoid(field_model.opacity_logit.detach().view(-1))
+    opacity = torch.sigmoid(field_model.opacity_logit.detach()[:before, 0])
     grad = gradient_score(field_model)
     scale = scale_score(field_model)
     source_indices = torch.arange(before, device=device, dtype=torch.long)
@@ -1059,10 +1060,12 @@ def apply_density_control(
     )
     split_count = int(split_idx.numel())
     if split_count > 0:
-        field_model.split_gaussians(
-            split_idx,
-            shrink_factor=float(cfg.split_shrink_factor),
-            offset_scale=float(cfg.split_offset_scale),
+        split_count = int(
+            field_model.split_gaussians(
+                split_idx,
+                shrink_factor=float(cfg.split_shrink_factor),
+                offset_scale=float(cfg.split_offset_scale),
+            )
         )
 
     clone_idx = select_clone_indices(
@@ -1081,12 +1084,12 @@ def apply_density_control(
     )
     clone_count = int(clone_idx.numel())
     if clone_count > 0:
-        field_model.clone_gaussians(clone_idx, jitter_scale=float(cfg.clone_jitter_scale))
+        clone_count = int(field_model.clone_gaussians(clone_idx, jitter_scale=float(cfg.clone_jitter_scale)))
 
     reseeded = 0
     if allow_reseed and view_ctx is not None and view_ctx.reseed_observations:
         for observation in view_ctx.reseed_observations:
-            reseeded += _reseed_for_observation(field_model, observation, cfg, step=step)
+            reseeded += int(_reseed_for_observation(field_model, observation, cfg, step=step))
 
     after = field_model.num_gaussians
     debug = build_density_debug_summary(
