@@ -1,7 +1,8 @@
 import torch
 from hypothesis import given, strategies as st
 
-from blender_temp.gaussian_sr.field import CanonicalGaussianField, ScaleAwareResidualHead
+from blender_temp.gaussian_sr.field import CanonicalGaussianField
+from blender_temp.gaussian_sr.residual_head import ScaleAwareResidualHead
 from blender_temp.gaussian_sr.image_utils import pixel_grid
 from blender_temp.gaussian_sr.posefree_config import AppearanceConfig, FieldConfig
 

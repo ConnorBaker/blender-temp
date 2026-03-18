@@ -19,7 +19,8 @@ from .density import (
     emit_density_event,
     should_run_density_control_for_stage,
 )
-from .field import CanonicalGaussianField, ScaleAwareResidualHead
+from .field import CanonicalGaussianField
+from .residual_head import ScaleAwareResidualHead
 from .image_utils import charbonnier, estimate_translation_bootstrap, ssim_value, tv_loss_grid
 from .math_utils import default_intrinsics
 from .observation_model import observation_render_size, render_observe_rgb

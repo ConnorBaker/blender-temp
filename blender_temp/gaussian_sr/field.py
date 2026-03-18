@@ -8,37 +8,10 @@ from torch import Tensor
 
 from .appearance import apply_view_dependent_rgb, num_sh_bases
 from .fixed_capacity import append_rows_in_place, available_capacity, compact_rows_in_place, resolve_capacity
-from .image_utils import pixel_grid
 from .math_utils import inverse_sigmoid, normalize_quaternion, quaternion_to_matrix
 from .posefree_config import AppearanceConfig, FieldConfig
 
-
-class ScaleAwareResidualHead(nn.Module):
-    def __init__(self, feature_dim: int, hidden_dim: int = 64, residual_scale: float = 0.05):
-        super().__init__()
-        self.residual_scale = residual_scale
-        self.net = nn.Sequential(
-            nn.Conv2d(feature_dim + 4, hidden_dim, kernel_size=1),
-            nn.SiLU(),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1),
-            nn.SiLU(),
-            nn.Conv2d(hidden_dim, 3, kernel_size=1),
-        )
-
-    def forward(
-        self,
-        latent_map: Tensor,
-        scale_x: float,
-        scale_y: float,
-        chunk: int = 262144,
-    ) -> Tensor:
-        del chunk
-        f_dim, h, w = latent_map.shape
-        coords = pixel_grid(h, w, latent_map.device, latent_map.dtype, normalized=True).permute(2, 0, 1).contiguous()
-        scale_token = latent_map.new_tensor([math.log(scale_x), math.log(scale_y)]).view(2, 1, 1).expand(2, h, w)
-        inp = torch.cat((latent_map.view(f_dim, h, w), coords, scale_token), dim=0).unsqueeze(0)
-        residual = self.net(inp).squeeze(0)
-        return self.residual_scale * torch.tanh(residual)
+_INT_BUFFER_KEYS = frozenset({"seed_id", "protect_until_step"})
 
 
 class CanonicalGaussianField(nn.Module):
@@ -73,15 +46,18 @@ class CanonicalGaussianField(nn.Module):
 
         fx, fy = focal
         cx, cy = principal
-        x = (uv_flat[:, 0:1] - cx) / fx
-        y = (uv_flat[:, 1:2] - cy) / fy
+        safe_fx = fx.clamp_min(1.0)
+        safe_fy = fy.clamp_min(1.0)
+        x = (uv_flat[:, 0:1] - cx) / safe_fx
+        y = (uv_flat[:, 1:2] - cy) / safe_fy
         ray = torch.cat((x, y, torch.ones_like(x)), dim=-1)
         means3d = ray * init_depth
 
-        sx = field_cfg.init_scale_xy * field_cfg.init_depth / max(float(fx.item()), 1.0) * s
-        sy = field_cfg.init_scale_xy * field_cfg.init_depth / max(float(fy.item()), 1.0) * s
-        sz = field_cfg.init_scale_z * field_cfg.init_depth
-        init_scale = torch.tensor([sx, sy, sz], device=device, dtype=dtype).expand(initial_count, 3)
+        init_scale_xy = field_cfg.init_scale_xy * field_cfg.init_depth
+        sx = init_scale_xy * s / safe_fx
+        sy = init_scale_xy * s / safe_fy
+        sz = anchor_rgb.new_tensor(field_cfg.init_scale_z * field_cfg.init_depth)
+        init_scale = torch.stack((sx, sy, sz)).expand(initial_count, 3)
         log_scale = torch.log(init_scale)
 
         quat = torch.zeros(initial_count, 4, device=device, dtype=dtype)
@@ -135,6 +111,8 @@ class CanonicalGaussianField(nn.Module):
         else:
             self.register_parameter("sh_coeffs", None)
 
+    # -- Capacity helpers --
+
     def _capacity_buffer(
         self,
         value: Tensor,
@@ -154,8 +132,26 @@ class CanonicalGaussianField(nn.Module):
             storage[: value.shape[0]].copy_(value.to(dtype=out_dtype))
         return storage.contiguous()
 
-    def _active_rows(self, tensor: Tensor) -> Tensor:
-        return tensor[: self.num_gaussians]
+    def _storage_rows(self) -> dict[str, Tensor]:
+        """Return a dict mapping each storage field name to its backing tensor."""
+        rows: dict[str, Tensor] = {
+            "uv": self.uv,
+            "seed_id": self.seed_id,
+            "protect_until_step": self.protect_until_step,
+            "means3d": self.means3d,
+            "quat_raw": self.quat_raw,
+            "log_scale": self.log_scale,
+            "opacity_logit": self.opacity_logit,
+            "rgb_logit": self.rgb_logit,
+            "latent": self.latent,
+        }
+        if self.sh_coeffs is not None:
+            rows["sh_coeffs"] = self.sh_coeffs
+        return rows
+
+    def _snapshot_rows(self, idx: Tensor) -> dict[str, Tensor]:
+        """Detach and clone all storage rows at the given indices."""
+        return {k: v[idx].detach().clone() for k, v in self._storage_rows().items()}
 
     def _set_active_count(self, value: int) -> None:
         self.active_count.fill_(int(value))
@@ -166,7 +162,9 @@ class CanonicalGaussianField(nn.Module):
 
     @property
     def gaussian_capacity(self) -> int:
-        return int(self.means3d.shape[0])
+        return self.means3d.shape[0]
+
+    # -- Optimizer support --
 
     def parameters_for_optimizer(self) -> Iterable[nn.Parameter]:
         yield self.means3d
@@ -191,6 +189,8 @@ class CanonicalGaussianField(nn.Module):
             params["sh_coeffs"] = self.sh_coeffs
         return params
 
+    # -- Mutation primitives --
+
     def _warn_overflow(self, op_name: str, dropped: int) -> None:
         if dropped <= 0:
             return
@@ -200,74 +200,35 @@ class CanonicalGaussianField(nn.Module):
             stacklevel=2,
         )
 
-    def _append_gaussians(
-        self,
-        *,
-        means3d: Tensor,
-        quat_raw: Tensor,
-        log_scale: Tensor,
-        opacity_logit: Tensor,
-        rgb_logit: Tensor,
-        latent: Tensor,
-        uv: Tensor | None = None,
-        seed_id: Tensor | None = None,
-        protect_until_step: Tensor | None = None,
-        sh_coeffs: Tensor | None = None,
-    ) -> int:
-        if means3d.numel() == 0:
+    def _append_rows(self, new_rows: dict[str, Tensor]) -> int:
+        """Append rows to storage. Detaches all values. Fills missing buffer keys with defaults."""
+        first = next(iter(new_rows.values()), None)
+        if first is None or first.numel() == 0:
             return 0
-        count = int(means3d.shape[0])
-        if uv is None:
-            uv = torch.zeros(count, 2, device=means3d.device, dtype=means3d.dtype)
-        if seed_id is None:
-            seed_id = torch.full((count,), -1, device=means3d.device, dtype=torch.long)
-        if protect_until_step is None:
-            protect_until_step = torch.full((count,), -1, device=means3d.device, dtype=torch.long)
-
-        rows: dict[str, Tensor] = {
-            "uv": self.uv,
-            "seed_id": self.seed_id,
-            "protect_until_step": self.protect_until_step,
-            "means3d": self.means3d,
-            "quat_raw": self.quat_raw,
-            "log_scale": self.log_scale,
-            "opacity_logit": self.opacity_logit,
-            "rgb_logit": self.rgb_logit,
-            "latent": self.latent,
-        }
-        new_rows: dict[str, Tensor] = {
-            "uv": uv.detach(),
-            "seed_id": seed_id.detach().to(dtype=torch.long),
-            "protect_until_step": protect_until_step.detach().to(dtype=torch.long),
-            "means3d": means3d.detach(),
-            "quat_raw": quat_raw.detach(),
-            "log_scale": log_scale.detach(),
-            "opacity_logit": opacity_logit.detach(),
-            "rgb_logit": rgb_logit.detach(),
-            "latent": latent.detach(),
-        }
+        count = first.shape[0]
+        device = self.means3d.device
+        dtype = self.means3d.dtype
+        new_rows.setdefault("uv", torch.zeros(count, 2, device=device, dtype=dtype))
+        new_rows.setdefault("seed_id", torch.full((count,), -1, device=device, dtype=torch.long))
+        new_rows.setdefault("protect_until_step", torch.full((count,), -1, device=device, dtype=torch.long))
         if self.sh_coeffs is not None:
-            if sh_coeffs is None:
-                sh_coeffs = torch.zeros(
-                    count,
-                    self.sh_coeffs.shape[1],
-                    self.sh_coeffs.shape[2],
-                    device=means3d.device,
-                    dtype=means3d.dtype,
-                )
-            rows["sh_coeffs"] = self.sh_coeffs
-            new_rows["sh_coeffs"] = sh_coeffs.detach()
-
+            new_rows.setdefault(
+                "sh_coeffs",
+                torch.zeros(count, self.sh_coeffs.shape[1], self.sh_coeffs.shape[2], device=device, dtype=dtype),
+            )
+        detached = {
+            k: v.detach().to(dtype=torch.long) if k in _INT_BUFFER_KEYS else v.detach() for k, v in new_rows.items()
+        }
         with torch.no_grad():
             result = append_rows_in_place(
-                rows,
+                self._storage_rows(),
                 active_count=self.num_gaussians,
-                new_rows=new_rows,
+                new_rows=detached,
                 overflow_policy=self.field_cfg.overflow_policy,
             )
             self._set_active_count(result.new_active_count)
-        self._warn_overflow("append_gaussians", int(result.dropped))
-        return int(result.appended)
+        self._warn_overflow("_append_rows", result.dropped)
+        return result.appended
 
     def append_gaussians(
         self,
@@ -283,7 +244,7 @@ class CanonicalGaussianField(nn.Module):
         seed_id: Tensor | None = None,
         protect_until_step: Tensor | None = None,
     ) -> int:
-        count = int(means3d.shape[0])
+        count = means3d.shape[0]
         if count <= 0:
             return 0
         device = means3d.device
@@ -305,18 +266,23 @@ class CanonicalGaussianField(nn.Module):
             latent = torch.zeros(count, self.feature_dim, device=device, dtype=dtype)
         opacity = opacity.clamp(1.0e-4, 1.0 - 1.0e-4)
         rgb = rgb.clamp(1.0e-4, 1.0 - 1.0e-4)
-        return self._append_gaussians(
-            means3d=means3d,
-            quat_raw=quat_raw,
-            log_scale=torch.log(scale.clamp_min(1.0e-8)),
-            opacity_logit=inverse_sigmoid(opacity),
-            rgb_logit=inverse_sigmoid(rgb),
-            latent=latent,
-            uv=uv,
-            seed_id=seed_id,
-            protect_until_step=protect_until_step,
-            sh_coeffs=sh_coeffs,
-        )
+        new_rows: dict[str, Tensor] = {
+            "means3d": means3d,
+            "quat_raw": quat_raw,
+            "log_scale": torch.log(scale.clamp_min(1.0e-8)),
+            "opacity_logit": inverse_sigmoid(opacity),
+            "rgb_logit": inverse_sigmoid(rgb),
+            "latent": latent,
+        }
+        if uv is not None:
+            new_rows["uv"] = uv
+        if seed_id is not None:
+            new_rows["seed_id"] = seed_id
+        if protect_until_step is not None:
+            new_rows["protect_until_step"] = protect_until_step
+        if sh_coeffs is not None:
+            new_rows["sh_coeffs"] = sh_coeffs
+        return self._append_rows(new_rows)
 
     def prune_keep_mask(self, keep_mask: Tensor) -> None:
         n = self.num_gaussians
@@ -324,136 +290,94 @@ class CanonicalGaussianField(nn.Module):
             raise ValueError("keep_mask must be [N]")
         if keep_mask.dtype != torch.bool:
             keep_mask = keep_mask.to(dtype=torch.bool)
-        if int(keep_mask.sum().item()) <= 0:
+        if int(keep_mask.sum()) <= 0:
             raise ValueError("prune_keep_mask would remove all gaussians")
-
-        rows: dict[str, Tensor] = {
-            "uv": self.uv,
-            "seed_id": self.seed_id,
-            "protect_until_step": self.protect_until_step,
-            "means3d": self.means3d,
-            "quat_raw": self.quat_raw,
-            "log_scale": self.log_scale,
-            "opacity_logit": self.opacity_logit,
-            "rgb_logit": self.rgb_logit,
-            "latent": self.latent,
-        }
-        if self.sh_coeffs is not None:
-            rows["sh_coeffs"] = self.sh_coeffs
         with torch.no_grad():
-            kept = compact_rows_in_place(rows, active_count=n, keep_mask=keep_mask.to(device=self.means3d.device))
+            kept = compact_rows_in_place(
+                self._storage_rows(), active_count=n, keep_mask=keep_mask.to(device=self.means3d.device)
+            )
             self._set_active_count(kept)
+
+    def _check_indices(self, indices: Tensor, op_name: str) -> Tensor:
+        """Validate and truncate indices for clone/split, handling overflow policy."""
+        idx = indices.to(device=self.means3d.device, dtype=torch.long).view(-1)
+        n = self.num_gaussians
+        if idx.max() >= n or idx.min() < 0:
+            raise ValueError(f"{op_name} indices out of range")
+        free = available_capacity(self.gaussian_capacity, n)
+        if idx.numel() > free:
+            if self.field_cfg.overflow_policy == "abort":
+                raise RuntimeError(f"{op_name} exceeded fixed-capacity storage")
+            self._warn_overflow(op_name, idx.numel() - free)
+            idx = idx[:free]
+        return idx
 
     def clone_gaussians(self, indices: Tensor, jitter_scale: float = 0.25) -> int:
         if indices.numel() == 0:
             return 0
-        idx = indices.to(device=self.means3d.device, dtype=torch.long).view(-1)
-        n = self.num_gaussians
-        if idx.max().item() >= n or idx.min().item() < 0:
-            raise ValueError("clone_gaussians indices out of range")
-
-        free = available_capacity(self.gaussian_capacity, n)
-        if idx.numel() > free:
-            if self.field_cfg.overflow_policy == "abort":
-                raise RuntimeError("clone_gaussians exceeded fixed-capacity storage")
-            self._warn_overflow("clone_gaussians", int(idx.numel() - free))
-            idx = idx[:free]
+        idx = self._check_indices(indices, "clone_gaussians")
         if idx.numel() == 0:
             return 0
 
         with torch.no_grad():
-            src_opacity = torch.sigmoid(self.opacity_logit[idx]) * 0.5
-            src_opacity = src_opacity.clamp(1.0e-4, 1.0 - 1.0e-4)
+            src_opacity = (torch.sigmoid(self.opacity_logit[idx]) * 0.5).clamp(1.0e-4, 1.0 - 1.0e-4)
             self.opacity_logit[idx] = inverse_sigmoid(src_opacity)
 
-            clone_means3d = self.means3d[idx].detach().clone()
-            clone_quat_raw = self.quat_raw[idx].detach().clone()
-            clone_log_scale = self.log_scale[idx].detach().clone()
-            clone_rgb_logit = self.rgb_logit[idx].detach().clone()
-            clone_latent = self.latent[idx].detach().clone()
-            clone_uv = self.uv[idx].detach().clone()
-            clone_protect_until_step = self.protect_until_step[idx].detach().clone()
-            clone_sh = None if self.sh_coeffs is None else self.sh_coeffs[idx].detach().clone()
+            cloned = self._snapshot_rows(idx)
+            cloned["seed_id"] = torch.full((idx.numel(),), -1, device=idx.device, dtype=torch.long)
+            cloned["opacity_logit"] = inverse_sigmoid(src_opacity)
 
             if jitter_scale > 0.0:
-                scale = torch.exp(clone_log_scale)
-                clone_means3d = clone_means3d + torch.randn_like(clone_means3d) * scale * float(jitter_scale)
+                scale = torch.exp(cloned["log_scale"])
+                cloned["means3d"] = cloned["means3d"] + torch.randn_like(cloned["means3d"]) * scale * jitter_scale
 
-            return self._append_gaussians(
-                means3d=clone_means3d,
-                quat_raw=clone_quat_raw,
-                log_scale=clone_log_scale,
-                opacity_logit=inverse_sigmoid(src_opacity),
-                rgb_logit=clone_rgb_logit,
-                latent=clone_latent,
-                uv=clone_uv,
-                protect_until_step=clone_protect_until_step,
-                sh_coeffs=clone_sh,
-            )
+            return self._append_rows(cloned)
 
     def split_gaussians(self, indices: Tensor, shrink_factor: float = 0.8, offset_scale: float = 0.75) -> int:
         if indices.numel() == 0:
             return 0
-        idx = indices.to(device=self.means3d.device, dtype=torch.long).view(-1)
-        n = self.num_gaussians
-        if idx.max().item() >= n or idx.min().item() < 0:
-            raise ValueError("split_gaussians indices out of range")
-
-        free = available_capacity(self.gaussian_capacity, n)
-        if idx.numel() > free:
-            if self.field_cfg.overflow_policy == "abort":
-                raise RuntimeError("split_gaussians exceeded fixed-capacity storage")
-            self._warn_overflow("split_gaussians", int(idx.numel() - free))
-            idx = idx[:free]
+        idx = self._check_indices(indices, "split_gaussians")
         if idx.numel() == 0:
             return 0
 
         with torch.no_grad():
-            orig_means3d = self.means3d[idx].detach().clone()
-            orig_log_scale = self.log_scale[idx].detach().clone()
-            rot = quaternion_to_matrix(normalize_quaternion(self.quat_raw[idx].detach()))
-            scales = torch.exp(orig_log_scale)
+            child = self._snapshot_rows(idx)
+            child["seed_id"] = torch.full((idx.numel(),), -1, device=idx.device, dtype=torch.long)
+
+            rot = quaternion_to_matrix(normalize_quaternion(child["quat_raw"]))
+            scales = torch.exp(child["log_scale"])
             axis_idx = scales.argmax(dim=1)
             batch = torch.arange(idx.shape[0], device=idx.device)
             axes = rot[batch, :, axis_idx]
             max_scale = scales.gather(1, axis_idx[:, None]).squeeze(1)
-            delta = axes * (max_scale * float(offset_scale)).unsqueeze(1)
+            delta = axes * (max_scale * offset_scale).unsqueeze(1)
 
-            shrink_log = math.log(max(float(shrink_factor), 1.0e-4))
-            new_log_scale = orig_log_scale + shrink_log
-            new_opacity = (torch.sigmoid(self.opacity_logit[idx]) * 0.5).clamp(1.0e-4, 1.0 - 1.0e-4)
-            new_opacity_logit = inverse_sigmoid(new_opacity)
+            shrink_log = math.log(max(shrink_factor, 1.0e-4))
+            new_log_scale = child["log_scale"] + shrink_log
+            new_opacity_logit = inverse_sigmoid(
+                (torch.sigmoid(self.opacity_logit[idx]) * 0.5).clamp(1.0e-4, 1.0 - 1.0e-4)
+            )
 
-            self.means3d[idx] = orig_means3d - delta
+            # Update parent in-place
+            self.means3d[idx] = child["means3d"] - delta
             self.log_scale[idx] = new_log_scale
             self.opacity_logit[idx] = new_opacity_logit
 
-            child_means3d = orig_means3d + delta
-            child_quat_raw = self.quat_raw[idx].detach().clone()
-            child_rgb_logit = self.rgb_logit[idx].detach().clone()
-            child_latent = self.latent[idx].detach().clone()
-            child_uv = self.uv[idx].detach().clone()
-            child_protect_until_step = self.protect_until_step[idx].detach().clone()
-            child_sh = None if self.sh_coeffs is None else self.sh_coeffs[idx].detach().clone()
+            # Setup child
+            child["means3d"] = child["means3d"] + delta
+            child["log_scale"] = new_log_scale
+            child["opacity_logit"] = new_opacity_logit
 
-            return self._append_gaussians(
-                means3d=child_means3d,
-                quat_raw=child_quat_raw,
-                log_scale=new_log_scale,
-                opacity_logit=new_opacity_logit,
-                rgb_logit=child_rgb_logit,
-                latent=child_latent,
-                uv=child_uv,
-                protect_until_step=child_protect_until_step,
-                sh_coeffs=child_sh,
-            )
+            return self._append_rows(child)
+
+    # -- Regularization --
 
     def seed_depth_tv(self) -> Tensor:
         n = self.num_gaussians
         if n <= 0:
             return self.means3d.new_tensor(0.0)
         keep = self.seed_id[:n] >= 0
-        if int(keep.sum().item()) <= 1:
+        if int(keep.sum()) <= 1:
             return self.means3d.new_tensor(0.0)
 
         sid = self.seed_id[:n][keep]
@@ -485,7 +409,7 @@ class CanonicalGaussianField(nn.Module):
         n = self.num_gaussians
         if n <= 0:
             return torch.zeros(0, device=self.means3d.device, dtype=torch.bool)
-        return self.protect_until_step[:n] >= int(step)
+        return self.protect_until_step[:n] >= step
 
     def enforce_protection(self, step: int, min_opacity: float) -> None:
         n = self.num_gaussians
@@ -494,7 +418,7 @@ class CanonicalGaussianField(nn.Module):
         mask = self.protected_mask(step)
         if not mask.any():
             return
-        opacity_floor = float(min(max(min_opacity, 1.0e-4), 1.0 - 1.0e-4))
+        opacity_floor = min(max(min_opacity, 1.0e-4), 1.0 - 1.0e-4)
         floor_logit = inverse_sigmoid(self.opacity_logit.new_tensor(opacity_floor))
         idx = mask.nonzero(as_tuple=False).squeeze(-1)
         with torch.no_grad():
@@ -508,6 +432,8 @@ class CanonicalGaussianField(nn.Module):
         with torch.no_grad():
             self.log_scale[:n].clamp_(min=floor)
 
+    # -- Parameter extraction --
+
     def gaussian_params(
         self,
         R_cw: Tensor | None = None,
@@ -515,21 +441,14 @@ class CanonicalGaussianField(nn.Module):
         padded: bool = False,
     ) -> dict[str, Tensor | None]:
         n = self.active_count  # keep as tensor to avoid graph break from .item()
-        if padded:
-            means3d = self.means3d
-            quat = normalize_quaternion(self.quat_raw)
-            scale = torch.exp(self.log_scale)
-            opacity = torch.sigmoid(self.opacity_logit[:, 0])
-            rgb = apply_view_dependent_rgb(self.rgb_logit, self.sh_coeffs, means3d, R_cw, t_cw, self.appearance_cfg)
-            latent = self.latent
-        else:
-            means3d = self.means3d[:n]
-            quat = normalize_quaternion(self.quat_raw[:n])
-            scale = torch.exp(self.log_scale[:n])
-            opacity = torch.sigmoid(self.opacity_logit[:n, 0])
-            sh_coeffs = None if self.sh_coeffs is None else self.sh_coeffs[:n]
-            rgb = apply_view_dependent_rgb(self.rgb_logit[:n], sh_coeffs, means3d, R_cw, t_cw, self.appearance_cfg)
-            latent = self.latent[:n]
+        s = slice(None) if padded else slice(None, n)
+        means3d = self.means3d[s]
+        quat = normalize_quaternion(self.quat_raw[s])
+        scale = torch.exp(self.log_scale[s])
+        opacity = torch.sigmoid(self.opacity_logit[s, 0])
+        sh_coeffs = None if self.sh_coeffs is None else self.sh_coeffs[s]
+        rgb = apply_view_dependent_rgb(self.rgb_logit[s], sh_coeffs, means3d, R_cw, t_cw, self.appearance_cfg)
+        latent = self.latent[s]
         return {
             "means3d": means3d,
             "quat": quat,
@@ -551,7 +470,4 @@ class CanonicalGaussianField(nn.Module):
         return self.gaussian_params(R_cw=R_cw, t_cw=t_cw, padded=padded)
 
 
-__all__ = [
-    "ScaleAwareResidualHead",
-    "CanonicalGaussianField",
-]
+__all__ = ["CanonicalGaussianField"]

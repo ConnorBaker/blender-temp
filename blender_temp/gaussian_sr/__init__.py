@@ -24,7 +24,8 @@ from .density import (
     should_run_density_control,
     should_run_density_control_for_stage,
 )
-from .field import CanonicalGaussianField, ScaleAwareResidualHead
+from .field import CanonicalGaussianField
+from .residual_head import ScaleAwareResidualHead
 from .fixed_capacity import (
     CapacityAppendResult,
     append_rows_in_place,
