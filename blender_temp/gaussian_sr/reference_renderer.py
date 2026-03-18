@@ -365,21 +365,40 @@ def project_gaussians_batched(
 
     def _project_one_view(viewmat: Tensor, K: Tensor) -> tuple[Tensor, ...]:
         proj = project_gaussians_reference(
-            means=means, quat=quat, scale=scale,
-            viewmat=viewmat, K=K,
-            width=width, height=height, cfg=cfg,
+            means=means,
+            quat=quat,
+            scale=scale,
+            viewmat=viewmat,
+            K=K,
+            width=width,
+            height=height,
+            cfg=cfg,
         )
-        return (proj.xys, proj.conic, proj.rho, proj.radius,
-                proj.tile_min, proj.tile_max, proj.num_tiles_hit, proj.depth_key)
+        return (
+            proj.xys,
+            proj.conic,
+            proj.rho,
+            proj.radius,
+            proj.tile_min,
+            proj.tile_max,
+            proj.num_tiles_hit,
+            proj.depth_key,
+        )
 
     xys, conic, rho, radius, tile_min, tile_max, num_tiles_hit, depth_key = torch.vmap(
-        _project_one_view, in_dims=(0, 0),
+        _project_one_view,
+        in_dims=(0, 0),
     )(viewmats, Ks)
 
     return ReferenceProjection(
-        xys=xys, conic=conic, rho=rho, radius=radius,
-        tile_min=tile_min, tile_max=tile_max,
-        num_tiles_hit=num_tiles_hit, depth_key=depth_key,
+        xys=xys,
+        conic=conic,
+        rho=rho,
+        radius=radius,
+        tile_min=tile_min,
+        tile_max=tile_max,
+        num_tiles_hit=num_tiles_hit,
+        depth_key=depth_key,
     )
 
 

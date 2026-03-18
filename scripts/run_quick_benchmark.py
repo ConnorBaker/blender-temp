@@ -241,7 +241,6 @@ def _profile_warp_render_path(
     output_dir: Path,
 ) -> dict[str, object]:
     scale, out_h, out_w = _stage_render_size(pipeline, cfg, resume_stage_index)
-    base_intr = pipeline.intrinsics.get()
     render_intr = pipeline._scale_intrinsics(out_h, out_w)
     R_all, t_all = pipeline.camera_model.world_to_camera()
     renderer_cfg = pipeline._renderer_config()
@@ -269,7 +268,6 @@ def _profile_warp_render_path(
         for _ in range(max(1, repeats)):
             field, viewmat, K, means3d, quat, scale_render, opacity, values, background, active_count = (
                 pipeline._prepare_render_payload_eager(
-                    base_intr,
                     render_intr,
                     R_all[view_index],
                     t_all[view_index],

@@ -64,9 +64,9 @@ def prepare_visibility_from_projection(
             "Projected intersection sort buffer exceeds configured budget: "
             f"M={int(meta['intersection_count'])} "
             f"estimated_sort_bytes={int(meta['estimated_sort_buffer_bytes'])} "
-            f"({float(int(meta['estimated_sort_buffer_bytes'])) / float(1024 ** 3):.2f} GiB) "
+            f"({float(int(meta['estimated_sort_buffer_bytes'])) / float(1024**3):.2f} GiB) "
             f"budget={int(meta['sort_buffer_budget_bytes'])} "
-            f"({float(int(meta['sort_buffer_budget_bytes'])) / float(1024 ** 3):.2f} GiB)"
+            f"({float(int(meta['sort_buffer_budget_bytes'])) / float(1024**3):.2f} GiB)"
         )
 
     device = projection.xys.device

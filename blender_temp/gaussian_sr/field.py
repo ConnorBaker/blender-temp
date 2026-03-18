@@ -45,7 +45,8 @@ class CanonicalGaussianField(nn.Module):
     def __init__(
         self,
         anchor_rgb: Tensor,
-        intrinsics: Tensor,
+        focal: Tensor,
+        principal: Tensor,
         field_cfg: FieldConfig,
         appearance_cfg: AppearanceConfig,
     ):
@@ -70,7 +71,8 @@ class CanonicalGaussianField(nn.Module):
         anchor_colors = anchor_rgb[:, ::s, ::s].permute(1, 2, 0).contiguous().view(-1, 3)
         init_depth = torch.full((initial_count, 1), field_cfg.init_depth, device=device, dtype=dtype)
 
-        fx, fy, cx, cy = intrinsics
+        fx, fy = focal
+        cx, cy = principal
         x = (uv_flat[:, 0:1] - cx) / fx
         y = (uv_flat[:, 1:2] - cy) / fy
         ray = torch.cat((x, y, torch.ones_like(x)), dim=-1)
@@ -508,12 +510,10 @@ class CanonicalGaussianField(nn.Module):
 
     def gaussian_params(
         self,
-        intrinsics: Tensor,
         R_cw: Tensor | None = None,
         t_cw: Tensor | None = None,
         padded: bool = False,
     ) -> dict[str, Tensor | None]:
-        del intrinsics
         n = self.active_count  # keep as tensor to avoid graph break from .item()
         if padded:
             means3d = self.means3d
@@ -544,12 +544,11 @@ class CanonicalGaussianField(nn.Module):
 
     def forward(
         self,
-        intrinsics: Tensor,
         R_cw: Tensor | None = None,
         t_cw: Tensor | None = None,
         padded: bool = False,
     ) -> dict[str, Tensor | None]:
-        return self.gaussian_params(intrinsics, R_cw=R_cw, t_cw=t_cw, padded=padded)
+        return self.gaussian_params(R_cw=R_cw, t_cw=t_cw, padded=padded)
 
 
 __all__ = [

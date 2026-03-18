@@ -36,13 +36,14 @@ def test_pose_vec_to_rt_preserves_translation_component(xi: torch.Tensor) -> Non
 )
 def test_default_intrinsics_center_matches_image_center(height: int, width: int, fov_degrees: float) -> None:
     init = CameraInit(default_fov_degrees=float(fov_degrees))
-    intr = default_intrinsics(height, width, device=torch.device("cpu"), dtype=torch.float32, init=init)
+    focal, principal = default_intrinsics(height, width, device=torch.device("cpu"), dtype=torch.float32, init=init)
 
-    assert intr.shape == (4,)
-    assert float(intr[0].item()) > 0.0
-    assert float(intr[1].item()) > 0.0
-    assert_close(intr[2], torch.tensor((width - 1.0) * 0.5, dtype=torch.float32), atol=1.0e-6, rtol=1.0e-6)
-    assert_close(intr[3], torch.tensor((height - 1.0) * 0.5, dtype=torch.float32), atol=1.0e-6, rtol=1.0e-6)
+    assert focal.shape == (2,)
+    assert principal.shape == (2,)
+    assert float(focal[0].item()) > 0.0
+    assert float(focal[1].item()) > 0.0
+    assert_close(principal[0], torch.tensor((width - 1.0) * 0.5, dtype=torch.float32), atol=1.0e-6, rtol=1.0e-6)
+    assert_close(principal[1], torch.tensor((height - 1.0) * 0.5, dtype=torch.float32), atol=1.0e-6, rtol=1.0e-6)
 
 
 def test_so3_exp_map_zero_returns_identity_with_finite_gradient() -> None:

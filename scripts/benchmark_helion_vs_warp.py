@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Comparative benchmark: Helion vs Warp Gaussian splatting renderer."""
+
 import argparse
 import json
 import sys
@@ -34,17 +35,20 @@ def time_cuda_call(fn, *args, warmup: int = 5, repeats: int = 20, **kwargs) -> d
         "min_ms": timings[0],
         "max_ms": timings[-1],
         "p95_ms": timings[int(len(timings) * 0.95)],
-        "std_ms": (sum((t - sum(timings)/len(timings))**2 for t in timings) / len(timings)) ** 0.5,
+        "std_ms": (sum((t - sum(timings) / len(timings)) ** 2 for t in timings) / len(timings)) ** 0.5,
     }
 
 
 def make_synthetic_scene(n: int, width: int, height: int, channels: int, device: torch.device):
     """Create a synthetic scene with n Gaussians."""
-    means = torch.stack([
-        torch.linspace(-0.5, 0.5, n, device=device),
-        torch.linspace(-0.3, 0.3, n, device=device),
-        torch.full((n,), 3.0, device=device),
-    ], dim=-1).float()
+    means = torch.stack(
+        [
+            torch.linspace(-0.5, 0.5, n, device=device),
+            torch.linspace(-0.3, 0.3, n, device=device),
+            torch.full((n,), 3.0, device=device),
+        ],
+        dim=-1,
+    ).float()
     quat = torch.zeros(n, 4, device=device, dtype=torch.float32)
     quat[:, 0] = 1.0
     scale = torch.full((n, 3), 0.05, device=device, dtype=torch.float32)
@@ -52,29 +56,45 @@ def make_synthetic_scene(n: int, width: int, height: int, channels: int, device:
     opacity = torch.full((n,), 0.5, device=device, dtype=torch.float32)
     background = torch.zeros(channels, device=device, dtype=torch.float32)
     viewmat = torch.eye(4, device=device, dtype=torch.float32)
-    K = torch.tensor([
-        [float(width), 0.0, width / 2.0],
-        [0.0, float(height), height / 2.0],
-        [0.0, 0.0, 1.0],
-    ], device=device, dtype=torch.float32)
+    K = torch.tensor(
+        [
+            [float(width), 0.0, width / 2.0],
+            [0.0, float(height), height / 2.0],
+            [0.0, 0.0, 1.0],
+        ],
+        device=device,
+        dtype=torch.float32,
+    )
     return {
-        "means": means, "quat": quat, "scale": scale,
-        "values": values, "opacity": opacity, "background": background,
-        "viewmat": viewmat, "K": K,
-        "width": width, "height": height,
+        "means": means,
+        "quat": quat,
+        "scale": scale,
+        "values": values,
+        "opacity": opacity,
+        "background": background,
+        "viewmat": viewmat,
+        "K": K,
+        "width": width,
+        "height": height,
     }
 
 
 def benchmark_forward(scene, cfg):
     def run():
         render_values(
-            means=scene["means"], quat=scene["quat"], scale=scene["scale"],
-            values=scene["values"], opacity=scene["opacity"],
+            means=scene["means"],
+            quat=scene["quat"],
+            scale=scene["scale"],
+            values=scene["values"],
+            opacity=scene["opacity"],
             background=scene["background"],
-            viewmat=scene["viewmat"], K=scene["K"],
-            width=scene["width"], height=scene["height"],
+            viewmat=scene["viewmat"],
+            K=scene["K"],
+            width=scene["width"],
+            height=scene["height"],
             cfg=cfg,
         )
+
     return time_cuda_call(run)
 
 
@@ -84,15 +104,21 @@ def benchmark_backward(scene, cfg):
         values = scene["values"].detach().requires_grad_(True)
         opacity = scene["opacity"].detach().requires_grad_(True)
         out = render_values(
-            means=means, quat=scene["quat"], scale=scene["scale"],
-            values=values, opacity=opacity,
+            means=means,
+            quat=scene["quat"],
+            scale=scene["scale"],
+            values=values,
+            opacity=opacity,
             background=scene["background"],
-            viewmat=scene["viewmat"], K=scene["K"],
-            width=scene["width"], height=scene["height"],
+            viewmat=scene["viewmat"],
+            K=scene["K"],
+            width=scene["width"],
+            height=scene["height"],
             cfg=cfg,
         )
         loss = out.sum()
         loss.backward()
+
     return time_cuda_call(run, warmup=3, repeats=10)
 
 

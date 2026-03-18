@@ -72,16 +72,13 @@ def _validate_helion_render_inputs(
     reduced_ok = {"values": values, "opacity": opacity, "background": background}
     for name, tensor in reduced_ok.items():
         if tensor.dtype not in _REDUCED_PRECISION_DTYPES:
-            raise ValueError(
-                f"{name} must be float32 or bfloat16 for Helion backend, got {tensor.dtype}"
-            )
+            raise ValueError(f"{name} must be float32 or bfloat16 for Helion backend, got {tensor.dtype}")
     # Consistency: values and background must share the same dtype so that the
     # kernel output dtype and background blending (accum + trans * bg) are
     # consistent.  opacity is allowed to differ since it's downcast later.
     if values.dtype != background.dtype:
         raise ValueError(
-            f"values and background must share the same dtype, "
-            f"got values={values.dtype}, background={background.dtype}"
+            f"values and background must share the same dtype, got values={values.dtype}, background={background.dtype}"
         )
 
     if means.ndim != 2 or means.shape[1] != 3:
@@ -260,17 +257,17 @@ def _make_batched_raster_forward_kernel(*, static_shapes: bool, runtime_autotune
 
     @helion.kernel(**kwargs)
     def batched_raster_forward(
-        tile_start: Tensor,       # [V, T] per-view tile starts
-        tile_end: Tensor,         # [V, T] per-view tile ends
-        sorted_vals: Tensor,      # [V, M_max] per-view intersection lists
-        pixel_x: Tensor,          # [W] shared pixel coords
-        pixel_y: Tensor,          # [H]
-        xys: Tensor,              # [V, N, 2] per-view projected positions (FP32)
-        conic: Tensor,            # [V, N, 3] per-view conics
-        rho: Tensor,              # [V, N] per-view rho
-        values_flat: Tensor,      # [V, N*C] per-view flattened values
-        opacity: Tensor,          # [V, N] per-view opacity
-        background: Tensor,       # [C] shared background
+        tile_start: Tensor,  # [V, T] per-view tile starts
+        tile_end: Tensor,  # [V, T] per-view tile ends
+        sorted_vals: Tensor,  # [V, M_max] per-view intersection lists
+        pixel_x: Tensor,  # [W] shared pixel coords
+        pixel_y: Tensor,  # [H]
+        xys: Tensor,  # [V, N, 2] per-view projected positions (FP32)
+        conic: Tensor,  # [V, N, 3] per-view conics
+        rho: Tensor,  # [V, N] per-view rho
+        values_flat: Tensor,  # [V, N*C] per-view flattened values
+        opacity: Tensor,  # [V, N] per-view opacity
+        background: Tensor,  # [C] shared background
         total_tiles: hl.constexpr,
         tiles_per_view: hl.constexpr,
         tiles_x: hl.constexpr,
@@ -298,11 +295,13 @@ def _make_batched_raster_forward_kernel(*, static_shapes: bool, runtime_autotune
 
         out_flat = torch.empty(
             [num_views * height * width * channels],
-            device=values_flat.device, dtype=values_flat.dtype,
+            device=values_flat.device,
+            dtype=values_flat.dtype,
         )
         final_T_flat = torch.empty(
             [num_views * height * width],
-            device=values_flat.device, dtype=torch.float32,
+            device=values_flat.device,
+            dtype=torch.float32,
         )
 
         for tile_tid in hl.tile(total_tiles):
@@ -372,7 +371,9 @@ def _make_batched_raster_forward_kernel(*, static_shapes: bool, runtime_autotune
                             trans_local = torch.where(accepted, trans_local * (1.0 - alpha), trans_local)
 
                     view_pixel_offset = view_id[:, None, None] * pixels_per_view
-                    out_idx = view_pixel_offset * channels + pixel_flat[:, :, None] * channels + tile_c.index[None, None, :]
+                    out_idx = (
+                        view_pixel_offset * channels + pixel_flat[:, :, None] * channels + tile_c.index[None, None, :]
+                    )
                     out_mask = pixel_valid[:, :, None] & channel_valid[None, None, :]
                     if background_is_zero != 0:
                         out_chunk = accum.to(values_flat.dtype)
@@ -406,16 +407,16 @@ def _make_visibility_stats_kernel(*, static_shapes: bool, runtime_autotune: bool
 
     @helion.kernel(**kwargs)
     def visibility_stats(
-        tile_start: Tensor,       # [V, T]
-        tile_end: Tensor,         # [V, T]
-        sorted_vals: Tensor,      # [V, M_max]
-        pixel_x: Tensor,          # [W]
-        pixel_y: Tensor,          # [H]
-        xys: Tensor,              # [V, N, 2]
-        conic: Tensor,            # [V, N, 3]
-        rho: Tensor,              # [V, N]
-        opacity: Tensor,          # [V, N]
-        residual_map: Tensor,     # [V, H, W]
+        tile_start: Tensor,  # [V, T]
+        tile_end: Tensor,  # [V, T]
+        sorted_vals: Tensor,  # [V, M_max]
+        pixel_x: Tensor,  # [W]
+        pixel_y: Tensor,  # [H]
+        xys: Tensor,  # [V, N, 2]
+        conic: Tensor,  # [V, N, 3]
+        rho: Tensor,  # [V, N]
+        opacity: Tensor,  # [V, N]
+        residual_map: Tensor,  # [V, H, W]
         total_tiles: hl.constexpr,
         tiles_per_view: hl.constexpr,
         tiles_x: hl.constexpr,
@@ -444,7 +445,9 @@ def _make_visibility_stats_kernel(*, static_shapes: bool, runtime_autotune: bool
         trans = torch.zeros_like(contrib)
         hits = torch.zeros_like(contrib)
         residual = torch.zeros_like(contrib)
-        error_map = torch.zeros([gaussian_count, error_bins_x * error_bins_y], device=opacity.device, dtype=torch.float32)
+        error_map = torch.zeros(
+            [gaussian_count, error_bins_x * error_bins_y], device=opacity.device, dtype=torch.float32
+        )
 
         for tile_tid in hl.tile(total_tiles):
             view_id = tile_tid.index // tiles_per_view
@@ -465,7 +468,9 @@ def _make_visibility_stats_kernel(*, static_shapes: bool, runtime_autotune: bool
                 pixel_valid = (py_idx < height) & (px_idx < width)
                 fy = hl.load(pixel_y, [py_idx], extra_mask=pixel_valid).to(torch.float32)
                 fx = hl.load(pixel_x, [px_idx], extra_mask=pixel_valid).to(torch.float32)
-                pixel_residual = hl.load(residual_map, [view_id, py_idx, px_idx], extra_mask=pixel_valid).to(torch.float32)
+                pixel_residual = hl.load(residual_map, [view_id, py_idx, px_idx], extra_mask=pixel_valid).to(
+                    torch.float32
+                )
                 bx = (px_idx * error_bins_x) // width
                 by = (py_idx * error_bins_y) // height
                 bin_idx = by * error_bins_x + bx
@@ -490,8 +495,7 @@ def _make_visibility_stats_kernel(*, static_shapes: bool, runtime_autotune: bool
                         dx = fx - xy0[:, None]
                         dy = fy - xy1[:, None]
                         sigma = (
-                            0.5 * (conic0[:, None] * dx * dx + conic2[:, None] * dy * dy)
-                            + conic1[:, None] * dx * dy
+                            0.5 * (conic0[:, None] * dx * dx + conic2[:, None] * dy * dy) + conic1[:, None] * dx * dy
                         )
                         alpha = opacity_k[:, None] * torch.exp(-sigma)
                         if antialiased != 0:
@@ -535,19 +539,19 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
 
     @helion.kernel(**kwargs)
     def raster_backward(
-        tile_start: Tensor,       # [V, T]
-        tile_end: Tensor,         # [V, T]
-        sorted_vals: Tensor,      # [V, M_max]
-        pixel_x: Tensor,          # [W]
-        pixel_y: Tensor,          # [H]
-        xys: Tensor,              # [V, N, 2]
-        conic: Tensor,            # [V, N, 3]
-        rho: Tensor,              # [V, N]
-        values_flat: Tensor,      # [V, N*C]
-        opacity: Tensor,          # [V, N]
-        background: Tensor,       # [C]
-        final_T_flat: Tensor,     # [V, H*W]
-        grad_out_flat: Tensor,    # [V, H*W*C]
+        tile_start: Tensor,  # [V, T]
+        tile_end: Tensor,  # [V, T]
+        sorted_vals: Tensor,  # [V, M_max]
+        pixel_x: Tensor,  # [W]
+        pixel_y: Tensor,  # [H]
+        xys: Tensor,  # [V, N, 2]
+        conic: Tensor,  # [V, N, 3]
+        rho: Tensor,  # [V, N]
+        values_flat: Tensor,  # [V, N*C]
+        opacity: Tensor,  # [V, N]
+        background: Tensor,  # [C]
+        final_T_flat: Tensor,  # [V, H*W]
+        grad_out_flat: Tensor,  # [V, H*W*C]
         total_tiles: hl.constexpr,
         tiles_per_view: hl.constexpr,
         tiles_x: hl.constexpr,
@@ -633,8 +637,7 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
                         dx = fx - xy0[:, None]
                         dy = fy - xy1[:, None]
                         sigma = (
-                            0.5 * (conic0[:, None] * dx * dx + conic2[:, None] * dy * dy)
-                            + conic1[:, None] * dx * dy
+                            0.5 * (conic0[:, None] * dx * dx + conic2[:, None] * dy * dy) + conic1[:, None] * dx * dy
                         )
                         weight_exp = torch.exp(-sigma)
                         alpha_base = opacity_k[:, None] * weight_exp
@@ -682,7 +685,9 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
                             grad_rho_contrib = torch.where(unclamped_accepted, dL_dalpha * alpha_base, 0.0)
                             reduced_grad_rho = torch.sum(grad_rho_contrib, dim=-1)
                             hl.atomic_add(grad_rho, [gid], reduced_grad_rho)
-                            dL_dalpha_base = torch.where(unclamped_accepted, dL_dalpha_base * rho_k[:, None], dL_dalpha_base)
+                            dL_dalpha_base = torch.where(
+                                unclamped_accepted, dL_dalpha_base * rho_k[:, None], dL_dalpha_base
+                            )
 
                         grad_opacity_contrib = torch.where(unclamped_accepted, dL_dalpha_base * weight_exp, 0.0)
                         reduced_grad_opacity = torch.sum(grad_opacity_contrib, dim=-1)
@@ -749,7 +754,13 @@ def _helion_rasterize_from_projection_forward_impl(
     prepared = _stabilize_prepared_visibility(prepared)
 
     return _helion_rasterize_prepared_forward_impl(
-        prepared, values, opacity, background, width, height, cfg,
+        prepared,
+        values,
+        opacity,
+        background,
+        width,
+        height,
+        cfg,
     )
 
 
@@ -798,7 +809,13 @@ def _helion_rasterize_prepared_forward_impl(
 
     # Route through the batched kernel with V=1.
     out_list, final_T_list = _helion_batched_rasterize_forward_impl(
-        [prepared], [values], [opacity], background, width, height, cfg,
+        [prepared],
+        [values],
+        [opacity],
+        background,
+        width,
+        height,
+        cfg,
     )
     out = out_list[0]
     final_T = final_T_list[0]
@@ -835,7 +852,13 @@ def _helion_rasterize_values_forward_impl(
         cfg=cfg,
     )
     return _helion_rasterize_from_projection_forward_impl(
-        projection, values, opacity, background, width, height, cfg,
+        projection,
+        values,
+        opacity,
+        background,
+        width,
+        height,
+        cfg,
     )
 
 
@@ -876,28 +899,15 @@ def _helion_batched_rasterize_forward_impl(
     max_intersections = max(p.sorted_vals.shape[0] for p in prepared_list)
     max_gaussians = max(v.shape[0] for v in values_list)
 
-    tile_start = torch.stack([p.tile_start for p in prepared_list])   # [V, T]
-    tile_end = torch.stack([p.tile_end for p in prepared_list])       # [V, T]
-    sorted_vals = torch.stack([
-        _pad_vector(p.sorted_vals, max_intersections) for p in prepared_list
-    ])  # [V, M_max]
-    xys = torch.stack([
-        _pad_rows(p.xys, max_gaussians) for p in prepared_list
-    ])  # [V, N, 2]
-    conic = torch.stack([
-        _pad_rows(p.conic, max_gaussians) for p in prepared_list
-    ])  # [V, N, 3]
-    rho_stacked = torch.stack([
-        _pad_vector(p.rho, max_gaussians) for p in prepared_list
-    ])  # [V, N]
+    tile_start = torch.stack([p.tile_start for p in prepared_list])  # [V, T]
+    tile_end = torch.stack([p.tile_end for p in prepared_list])  # [V, T]
+    sorted_vals = torch.stack([_pad_vector(p.sorted_vals, max_intersections) for p in prepared_list])  # [V, M_max]
+    xys = torch.stack([_pad_rows(p.xys, max_gaussians) for p in prepared_list])  # [V, N, 2]
+    conic = torch.stack([_pad_rows(p.conic, max_gaussians) for p in prepared_list])  # [V, N, 3]
+    rho_stacked = torch.stack([_pad_vector(p.rho, max_gaussians) for p in prepared_list])  # [V, N]
 
-    values_flat = torch.stack([
-        _pad_rows(v.contiguous(), max_gaussians).view(-1)
-        for v in values_list
-    ])  # [V, N*C]
-    opacity_stacked = torch.stack([
-        _pad_vector(o, max_gaussians) for o in opacity_list
-    ])  # [V, N]
+    values_flat = torch.stack([_pad_rows(v.contiguous(), max_gaussians).view(-1) for v in values_list])  # [V, N*C]
+    opacity_stacked = torch.stack([_pad_vector(o, max_gaussians) for o in opacity_list])  # [V, N]
 
     # Downcast to match values dtype
     values_dtype = values_list[0].dtype
@@ -1157,7 +1167,17 @@ def helion_rasterize_values_op(
         helion_runtime_autotune=helion_runtime_autotune,
     )
     out, _prepared, _final_T, _stop_idx = _helion_rasterize_values_forward_impl(
-        means, quat, scale, values, opacity, background, viewmat, K, width, height, cfg,
+        means,
+        quat,
+        scale,
+        values,
+        opacity,
+        background,
+        viewmat,
+        K,
+        width,
+        height,
+        cfg,
     )
     return out
 
@@ -1197,12 +1217,28 @@ def _helion_rasterize_values_setup_context(
     output: Tensor,
 ) -> None:
     (
-        means, quat, scale, values, opacity, background,
-        viewmat, K, width, height,
-        backward_impl, rasterize_mode, tile_size,
-        near_plane, far_plane, eps2d, radius_clip,
-        alpha_min, transmittance_eps, clamp_alpha_max,
-        helion_static_shapes, helion_runtime_autotune,
+        means,
+        quat,
+        scale,
+        values,
+        opacity,
+        background,
+        viewmat,
+        K,
+        width,
+        height,
+        backward_impl,
+        rasterize_mode,
+        tile_size,
+        near_plane,
+        far_plane,
+        eps2d,
+        radius_clip,
+        alpha_min,
+        transmittance_eps,
+        clamp_alpha_max,
+        helion_static_shapes,
+        helion_runtime_autotune,
     ) = inputs
     cfg = RasterConfig(
         backend="helion",
@@ -1221,16 +1257,39 @@ def _helion_rasterize_values_setup_context(
     )
     # Re-run forward to capture intermediate state for backward
     _out, prepared, final_T, stop_idx = _helion_rasterize_values_forward_impl(
-        means, quat, scale, values, opacity, background, viewmat, K, width, height, cfg,
+        means,
+        quat,
+        scale,
+        values,
+        opacity,
+        background,
+        viewmat,
+        K,
+        width,
+        height,
+        cfg,
     )
     ctx.cfg = cfg
     ctx.width = int(width)
     ctx.height = int(height)
     ctx.save_for_backward(
-        means, quat, scale, values, opacity, background, viewmat, K,
-        prepared.xys, prepared.conic, prepared.rho, prepared.num_tiles_hit,
-        prepared.tile_start, prepared.tile_end, prepared.sorted_vals,
-        final_T, stop_idx,
+        means,
+        quat,
+        scale,
+        values,
+        opacity,
+        background,
+        viewmat,
+        K,
+        prepared.xys,
+        prepared.conic,
+        prepared.rho,
+        prepared.num_tiles_hit,
+        prepared.tile_start,
+        prepared.tile_end,
+        prepared.sorted_vals,
+        final_T,
+        stop_idx,
     )
 
 
@@ -1239,10 +1298,23 @@ def _helion_rasterize_values_backward(
     grad_out: Tensor,
 ) -> tuple[Tensor | None, ...]:
     (
-        means, quat, scale, values, opacity, background, viewmat, K,
-        xys, conic, rho, num_tiles_hit,
-        tile_start, tile_end, sorted_vals,
-        final_T, stop_idx,
+        means,
+        quat,
+        scale,
+        values,
+        opacity,
+        background,
+        viewmat,
+        K,
+        xys,
+        conic,
+        rho,
+        num_tiles_hit,
+        tile_start,
+        tile_end,
+        sorted_vals,
+        final_T,
+        stop_idx,
     ) = ctx.saved_tensors
     result = _helion_rasterize_values_backward_impl(
         grad_out,
@@ -1304,18 +1376,40 @@ class _HelionRasterizePreparedFunction(torch.autograd.Function):
         return_prepared: bool,
     ) -> Tensor | tuple[Tensor, PreparedVisibility]:
         out, prepared, final_T, stop_idx = _helion_rasterize_values_forward_impl(
-            means, quat, scale, values, opacity, background, viewmat, K,
-            int(width), int(height), cfg,
+            means,
+            quat,
+            scale,
+            values,
+            opacity,
+            background,
+            viewmat,
+            K,
+            int(width),
+            int(height),
+            cfg,
         )
         ctx.cfg = cfg
         ctx.width = int(width)
         ctx.height = int(height)
         ctx.return_prepared = bool(return_prepared)
         ctx.save_for_backward(
-            means, quat, scale, values, opacity, background, viewmat, K,
-            prepared.xys, prepared.conic, prepared.rho, prepared.num_tiles_hit,
-            prepared.tile_start, prepared.tile_end, prepared.sorted_vals,
-            final_T, stop_idx,
+            means,
+            quat,
+            scale,
+            values,
+            opacity,
+            background,
+            viewmat,
+            K,
+            prepared.xys,
+            prepared.conic,
+            prepared.rho,
+            prepared.num_tiles_hit,
+            prepared.tile_start,
+            prepared.tile_end,
+            prepared.sorted_vals,
+            final_T,
+            stop_idx,
         )
         if return_prepared:
             return out, prepared
@@ -1328,10 +1422,23 @@ class _HelionRasterizePreparedFunction(torch.autograd.Function):
     ) -> tuple[Tensor | None, ...]:
         grad_out = grad_outputs[0]
         (
-            means, quat, scale, values, opacity, background, viewmat, K,
-            xys, conic, rho, num_tiles_hit,
-            tile_start, tile_end, sorted_vals,
-            final_T, stop_idx,
+            means,
+            quat,
+            scale,
+            values,
+            opacity,
+            background,
+            viewmat,
+            K,
+            xys,
+            conic,
+            rho,
+            num_tiles_hit,
+            tile_start,
+            tile_end,
+            sorted_vals,
+            final_T,
+            stop_idx,
         ) = ctx.saved_tensors
         result = _helion_rasterize_values_backward_impl(
             grad_out,

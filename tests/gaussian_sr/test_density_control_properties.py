@@ -21,18 +21,13 @@ from .strategies import DEFAULT_SETTINGS, chw_images
 
 
 def _make_test_field(anchor_rgb: torch.Tensor, stride: int = 2, feature_dim: int = 2) -> CanonicalGaussianField:
-    intrinsics = torch.tensor(
-        [
-            float(anchor_rgb.shape[-1]),
-            float(anchor_rgb.shape[-2]),
-            (anchor_rgb.shape[-1] - 1.0) * 0.5,
-            (anchor_rgb.shape[-2] - 1.0) * 0.5,
-        ],
-        dtype=torch.float32,
-    )
+    w, h = anchor_rgb.shape[-1], anchor_rgb.shape[-2]
+    focal = torch.tensor([float(w), float(h)], dtype=torch.float32)
+    principal = torch.tensor([(w - 1.0) * 0.5, (h - 1.0) * 0.5], dtype=torch.float32)
     return CanonicalGaussianField(
         anchor_rgb=anchor_rgb,
-        intrinsics=intrinsics,
+        focal=focal,
+        principal=principal,
         field_cfg=FieldConfig(anchor_stride=stride, feature_dim=feature_dim),
         appearance_cfg=AppearanceConfig(mode="constant"),
     )

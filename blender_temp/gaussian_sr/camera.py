@@ -1,71 +1,78 @@
-import math
-
 import torch
 import torch.nn as nn
 from torch import Tensor
 
-from .math_utils import pose_vec_to_rt
+from .math_utils import so3_exp_map
 
 
 class LearnableSharedIntrinsics(nn.Module):
-    def __init__(self, initial: Tensor, learn_intrinsics: bool):
+    def __init__(
+        self,
+        focal: Tensor,
+        principal: Tensor,
+        *,
+        learn: bool,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
         super().__init__()
-        fx, fy, cx, cy = initial.tolist()
-        register = self.register_parameter if learn_intrinsics else self.register_buffer
-        wrap = nn.Parameter if learn_intrinsics else (lambda x: x)
+        self.log_focal = nn.Parameter(
+            torch.log(focal.to(device=device, dtype=dtype)),
+            requires_grad=learn,
+        )
+        self.principal = nn.Parameter(
+            principal.to(device=device, dtype=dtype),
+            requires_grad=learn,
+        )
 
-        def _register_scalar(name: str, value: float) -> None:
-            register(name, wrap(torch.tensor(value, device=initial.device, dtype=initial.dtype)))
-
-        _register_scalar("log_fx", math.log(fx))
-        _register_scalar("log_fy", math.log(fy))
-        _register_scalar("cx", cx)
-        _register_scalar("cy", cy)
-
-    def get(self, scale_x: float = 1.0, scale_y: float = 1.0) -> Tensor:
-        fx = torch.exp(self.log_fx) * scale_x
-        fy = torch.exp(self.log_fy) * scale_y
-        cx = (self.cx + 0.5) * scale_x - 0.5
-        cy = (self.cy + 0.5) * scale_y - 0.5
-        return torch.stack((fx, fy, cx, cy), dim=0)
+    def get(self, scale: Tensor) -> tuple[Tensor, Tensor]:
+        """Return (focal, principal) scaled by ``scale`` ([sx, sy] tensor)."""
+        focal = torch.exp(self.log_focal) * scale
+        pp = (self.principal + 0.5) * scale - 0.5
+        return focal, pp
 
 
 class LearnableCameraBundle(nn.Module):
+    """Per-view camera poses.  View 0 is always identity; views 1..V-1
+    have learnable rotation (so3) and translation parameters."""
+
     def __init__(
         self,
         num_views: int,
-        fx: float,
-        fy: float,
-        init_shifts_px: Tensor | None,
+        *,
+        focal: Tensor | None = None,
+        init_shifts_px: Tensor | None = None,
         device: torch.device,
         dtype: torch.dtype,
     ):
         super().__init__()
         if num_views < 1:
             raise ValueError("num_views must be >= 1")
+        if num_views > 1 and focal is None:
+            raise ValueError("focal is required for multi-view camera bundle")
 
-        init_pose = torch.zeros(num_views - 1, 6, device=device, dtype=dtype)
-        if num_views > 1 and init_shifts_px is not None:
-            init_pose[:, 3] = -init_shifts_px[1:, 0] / max(fx, 1.0)
-            init_pose[:, 4] = -init_shifts_px[1:, 1] / max(fy, 1.0)
+        rest = num_views - 1
+        learn = rest > 0
+        init_omega = torch.zeros(rest, 3, device=device, dtype=dtype)
+        init_trans = torch.zeros(rest, 3, device=device, dtype=dtype)
+        if learn and init_shifts_px is not None:
+            init_trans[:, 0] = -init_shifts_px[1:, 0] / focal[0].clamp(min=1.0)
+            init_trans[:, 1] = -init_shifts_px[1:, 1] / focal[1].clamp(min=1.0)
 
-        self.pose_rest = nn.Parameter(init_pose)
+        self.omega_rest = nn.Parameter(init_omega, requires_grad=learn)
+        self.trans_rest = nn.Parameter(init_trans, requires_grad=learn)
+        self.register_buffer("_identity_R", torch.eye(3, device=device, dtype=dtype)[None])
+        self.register_buffer("_zero_t", torch.zeros(1, 3, device=device, dtype=dtype))
 
     def world_to_camera(self) -> tuple[Tensor, Tensor]:
-        if self.pose_rest.numel() == 0:
-            r = torch.eye(3, device=self.pose_rest.device, dtype=self.pose_rest.dtype)[None]
-            t = torch.zeros(1, 3, device=self.pose_rest.device, dtype=self.pose_rest.dtype)
-            return r, t
-
-        zeros = torch.zeros(1, 6, device=self.pose_rest.device, dtype=self.pose_rest.dtype)
-        xi = torch.cat((zeros, self.pose_rest), dim=0)
-        r, t = pose_vec_to_rt(xi)
-        return r, t
+        R = torch.cat((self._identity_R, so3_exp_map(self.omega_rest)), dim=0)
+        t = torch.cat((self._zero_t, self.trans_rest), dim=0)
+        return R, t
 
     def pose_regularizer(self) -> Tensor:
-        if self.pose_rest.numel() == 0:
-            return self.pose_rest.new_tensor(0.0)
-        return (self.pose_rest * self.pose_rest).mean()
+        total = torch.square(self.omega_rest).sum() + torch.square(self.trans_rest).sum()
+        n = self.omega_rest.numel() + self.trans_rest.numel()
+        return total / max(n, 1)
 
 
 __all__ = [

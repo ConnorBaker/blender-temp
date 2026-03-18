@@ -8,24 +8,20 @@ from blender_temp.gaussian_sr.posefree_config import AppearanceConfig, FieldConf
 from .strategies import DEFAULT_SETTINGS, chw_images
 
 
-def _make_intrinsics(height: int, width: int) -> torch.Tensor:
-    return torch.tensor(
-        [
-            float(max(width, 1)),
-            float(max(height, 1)),
-            (width - 1.0) * 0.5,
-            (height - 1.0) * 0.5,
-        ],
-        dtype=torch.float32,
-    )
+def _make_intrinsics(height: int, width: int) -> tuple[torch.Tensor, torch.Tensor]:
+    focal = torch.tensor([float(max(width, 1)), float(max(height, 1))], dtype=torch.float32)
+    principal = torch.tensor([(width - 1.0) * 0.5, (height - 1.0) * 0.5], dtype=torch.float32)
+    return focal, principal
 
 
-def _make_field(anchor_rgb: torch.Tensor, stride: int, feature_dim: int) -> tuple[CanonicalGaussianField, torch.Tensor]:
+def _make_field(
+    anchor_rgb: torch.Tensor, stride: int, feature_dim: int
+) -> tuple[CanonicalGaussianField, tuple[torch.Tensor, torch.Tensor]]:
     field_cfg = FieldConfig(anchor_stride=stride, feature_dim=feature_dim)
     appearance_cfg = AppearanceConfig(mode="constant")
-    intrinsics = _make_intrinsics(anchor_rgb.shape[-2], anchor_rgb.shape[-1])
-    field = CanonicalGaussianField(anchor_rgb, intrinsics, field_cfg, appearance_cfg)
-    return field, intrinsics
+    focal, principal = _make_intrinsics(anchor_rgb.shape[-2], anchor_rgb.shape[-1])
+    field = CanonicalGaussianField(anchor_rgb, focal, principal, field_cfg, appearance_cfg)
+    return field, (focal, principal)
 
 
 def _assert_aligned_lengths(field: CanonicalGaussianField) -> None:
@@ -200,9 +196,11 @@ def test_scale_aware_residual_head_matches_legacy_pointwise_mlp() -> None:
 def test_density_mutations_preserve_parameter_identity_with_fixed_capacity() -> None:
     anchor_rgb = torch.full((3, 4, 4), 0.5, dtype=torch.float32)
     field_cfg = FieldConfig(anchor_stride=2, feature_dim=2, gaussian_capacity=8)
+    focal, principal = _make_intrinsics(anchor_rgb.shape[-2], anchor_rgb.shape[-1])
     field = CanonicalGaussianField(
         anchor_rgb,
-        _make_intrinsics(anchor_rgb.shape[-2], anchor_rgb.shape[-1]),
+        focal,
+        principal,
         field_cfg,
         AppearanceConfig(mode="constant"),
     )

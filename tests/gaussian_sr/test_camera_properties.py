@@ -24,20 +24,19 @@ def test_shared_intrinsics_scaling_matches_pixel_center_formula(
     scale_x: float,
     scale_y: float,
 ) -> None:
-    initial = torch.tensor([fx, fy, cx, cy], dtype=torch.float32)
-    intr = LearnableSharedIntrinsics(initial=initial, learn_intrinsics=False)
-    out = intr.get(scale_x=float(scale_x), scale_y=float(scale_y))
+    focal = torch.tensor([fx, fy], dtype=torch.float32)
+    principal = torch.tensor([cx, cy], dtype=torch.float32)
+    scale = torch.tensor([scale_x, scale_y], dtype=torch.float32)
+    intr = LearnableSharedIntrinsics(focal, principal, learn=False, device=torch.device("cpu"), dtype=torch.float32)
+    out_focal, out_pp = intr.get(scale)
 
-    expected = torch.tensor(
-        [
-            float(fx) * float(scale_x),
-            float(fy) * float(scale_y),
-            (float(cx) + 0.5) * float(scale_x) - 0.5,
-            (float(cy) + 0.5) * float(scale_y) - 0.5,
-        ],
+    expected_focal = torch.tensor([fx * scale_x, fy * scale_y], dtype=torch.float32)
+    expected_pp = torch.tensor(
+        [(cx + 0.5) * scale_x - 0.5, (cy + 0.5) * scale_y - 0.5],
         dtype=torch.float32,
     )
-    assert_close(out, expected, atol=1.0e-6, rtol=1.0e-6)
+    assert_close(out_focal, expected_focal, atol=1.0e-6, rtol=1.0e-6)
+    assert_close(out_pp, expected_pp, atol=1.0e-6, rtol=1.0e-6)
 
 
 @DEFAULT_SETTINGS
@@ -46,8 +45,7 @@ def test_camera_bundle_keeps_first_view_identity_and_regularizer_nonnegative(num
     init_shifts_px = torch.zeros(num_views, 2, dtype=torch.float32)
     bundle = LearnableCameraBundle(
         num_views=num_views,
-        fx=1000.0,
-        fy=1000.0,
+        focal=torch.tensor([1000.0, 1000.0]),
         init_shifts_px=init_shifts_px,
         device=torch.device("cpu"),
         dtype=torch.float32,
@@ -62,11 +60,13 @@ def test_camera_bundle_keeps_first_view_identity_and_regularizer_nonnegative(num
 
 
 def test_shared_intrinsics_registers_parameters_only_when_learnable() -> None:
-    initial = torch.tensor([1000.0, 900.0, 320.0, 240.0], dtype=torch.float32)
+    focal = torch.tensor([1000.0, 900.0], dtype=torch.float32)
+    principal = torch.tensor([320.0, 240.0], dtype=torch.float32)
 
-    learnable = LearnableSharedIntrinsics(initial=initial, learn_intrinsics=True)
-    frozen = LearnableSharedIntrinsics(initial=initial, learn_intrinsics=False)
+    learnable = LearnableSharedIntrinsics(focal, principal, learn=True, device=torch.device("cpu"), dtype=torch.float32)
+    frozen = LearnableSharedIntrinsics(focal, principal, learn=False, device=torch.device("cpu"), dtype=torch.float32)
 
-    assert set(dict(learnable.named_parameters()).keys()) == {"log_fx", "log_fy", "cx", "cy"}
-    assert set(dict(frozen.named_parameters()).keys()) == set()
-    assert set(dict(frozen.named_buffers()).keys()) == {"log_fx", "log_fy", "cx", "cy"}
+    assert set(dict(learnable.named_parameters()).keys()) == {"log_focal", "principal"}
+    # frozen: both are nn.Parameter with requires_grad=False, so they
+    # appear in parameters() but with grad disabled.
+    assert all(not p.requires_grad for p in frozen.parameters())

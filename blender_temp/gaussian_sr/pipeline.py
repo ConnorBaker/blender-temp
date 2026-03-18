@@ -270,7 +270,8 @@ class PoseFreeGaussianSR(nn.Module):
     def __init__(
         self,
         image_shape: Sequence[int],
-        intrinsics_init: Tensor,
+        focal_init: Tensor,
+        principal_init: Tensor,
         num_views: int,
         config: PoseFreeGaussianConfig | None = None,
         anchor_rgb: Tensor | None = None,
@@ -292,16 +293,18 @@ class PoseFreeGaussianSR(nn.Module):
         self.num_views = int(num_views)
 
         self.intrinsics = LearnableSharedIntrinsics(
-            initial=intrinsics_init,
-            learn_intrinsics=self.config.camera.learn_intrinsics,
+            focal=focal_init,
+            principal=principal_init,
+            learn=self.config.camera.learn_intrinsics,
+            device=focal_init.device,
+            dtype=focal_init.dtype,
         )
         self.field_model = CanonicalGaussianField(
-            anchor_rgb, intrinsics_init, self.config.field, self.config.appearance
+            anchor_rgb, focal_init, principal_init, self.config.field, self.config.appearance
         )
         self.camera_model = LearnableCameraBundle(
             num_views=num_views,
-            fx=float(intrinsics_init[0].item()),
-            fy=float(intrinsics_init[1].item()),
+            focal=focal_init,
             init_shifts_px=init_shifts_px,
             device=anchor_rgb.device,
             dtype=anchor_rgb.dtype,
@@ -355,15 +358,17 @@ class PoseFreeGaussianSR(nn.Module):
         _, _, h, w = images.shape
 
         if intrinsics is None:
-            intrinsics_init = default_intrinsics(h, w, device, dtype, config.camera)
+            focal_init, principal_init = default_intrinsics(h, w, device, dtype, config.camera)
         else:
-            intrinsics_init = intrinsics.to(device=device, dtype=dtype)
+            intr = intrinsics.to(device=device, dtype=dtype)
+            focal_init, principal_init = intr[:2], intr[2:]
 
         shifts = estimate_translation_bootstrap(images) if config.train.use_phasecorr_init else None
 
         return cls(
             image_shape=tuple(images.shape),
-            intrinsics_init=intrinsics_init,
+            focal_init=focal_init,
+            principal_init=principal_init,
             num_views=images.shape[0],
             config=config,
             anchor_rgb=images[0],
@@ -385,11 +390,23 @@ class PoseFreeGaussianSR(nn.Module):
         ]
         if "sh_coeffs" in fp:
             param_groups.append({"params": [fp["sh_coeffs"]], "lr": train_cfg.lr_sh, "name": "sh"})
-        param_groups.append({"params": list(self.camera_model.parameters()), "lr": train_cfg.lr_camera, "name": "camera"})
+        param_groups.append({
+            "params": list(self.camera_model.parameters()),
+            "lr": train_cfg.lr_camera,
+            "name": "camera",
+        })
         if self.config.camera.learn_intrinsics:
-            param_groups.append({"params": list(self.intrinsics.parameters()), "lr": train_cfg.lr_camera, "name": "intrinsics"})
+            param_groups.append({
+                "params": list(self.intrinsics.parameters()),
+                "lr": train_cfg.lr_camera,
+                "name": "intrinsics",
+            })
         if self.residual_head is not None:
-            param_groups.append({"params": list(self.residual_head.parameters()), "lr": train_cfg.lr_residual, "name": "residual"})
+            param_groups.append({
+                "params": list(self.residual_head.parameters()),
+                "lr": train_cfg.lr_residual,
+                "name": "residual",
+            })
         # Adam epsilon=1e-15 follows 3DGS; much smaller than PyTorch default
         # (1e-8).  This prevents the adaptive LR from being dominated by
         # epsilon when second-moment estimates are very small.
@@ -460,10 +477,12 @@ class PoseFreeGaussianSR(nn.Module):
                         buf[new_start:new_active].zero_()
         return old_opt
 
-    def _scale_intrinsics(self, out_h: int, out_w: int) -> Tensor:
-        scale_x = out_w / self.train_width
-        scale_y = out_h / self.train_height
-        return self.intrinsics.get(scale_x=scale_x, scale_y=scale_y)
+    def _scale_intrinsics(self, out_h: int, out_w: int) -> tuple[Tensor, Tensor]:
+        scale = self.intrinsics.log_focal.new_tensor([
+            out_w / self.train_width,
+            out_h / self.train_height,
+        ])
+        return self.intrinsics.get(scale)
 
     def _renderer_config(self) -> RasterConfig:
         render_cfg = self.config.render
@@ -490,9 +509,10 @@ class PoseFreeGaussianSR(nn.Module):
         viewmat[:3, 3] = t_cw
         return viewmat
 
-    def _K_from_intrinsics(self, intrinsics: Tensor) -> Tensor:
-        fx, fy, cx, cy = intrinsics.unbind(dim=0)
-        K = torch.eye(3, device=intrinsics.device, dtype=intrinsics.dtype)
+    def _K_from_intrinsics(self, focal: Tensor, principal: Tensor) -> Tensor:
+        fx, fy = focal.unbind(dim=0)
+        cx, cy = principal.unbind(dim=0)
+        K = torch.eye(3, device=focal.device, dtype=focal.dtype)
         K[0, 0] = fx
         K[1, 1] = fy
         K[0, 2] = cx
@@ -519,9 +539,11 @@ class PoseFreeGaussianSR(nn.Module):
         bg[:3] = torch.tensor(self.config.render.bg_color, device=device, dtype=render_dtype)
         return bg
 
-    def _render_inputs(self, field: dict[str, Tensor | None], R_cw: Tensor, t_cw: Tensor, intrinsics: Tensor):
+    def _render_inputs(
+        self, field: dict[str, Tensor | None], R_cw: Tensor, t_cw: Tensor, intrinsics: tuple[Tensor, Tensor]
+    ):
         viewmat = self._viewmat_from_pose(R_cw, t_cw)
-        K = self._K_from_intrinsics(intrinsics)
+        K = self._K_from_intrinsics(*intrinsics)
         means3d = field["means3d"]
         quat = field["quat"]
         scale = field["scale"]
@@ -544,12 +566,11 @@ class PoseFreeGaussianSR(nn.Module):
 
     def _prepare_render_payload_eager(
         self,
-        base_intrinsics: Tensor,
-        render_intrinsics: Tensor,
+        render_intrinsics: tuple[Tensor, Tensor],
         R_cw: Tensor,
         t_cw: Tensor,
     ):
-        field = self.field_model(base_intrinsics, R_cw=R_cw, t_cw=t_cw, padded=True)
+        field = self.field_model(R_cw=R_cw, t_cw=t_cw, padded=True)
         viewmat, K, means3d, quat, scale, opacity, values, background, active_count = self._render_inputs(
             field,
             R_cw,
@@ -563,7 +584,7 @@ class PoseFreeGaussianSR(nn.Module):
         field: dict[str, Tensor | None],
         R_cw: Tensor,
         t_cw: Tensor,
-        intrinsics: Tensor,
+        intrinsics: tuple[Tensor, Tensor],
         out_h: int,
         out_w: int,
         residual_map: Tensor | None = None,
@@ -706,8 +727,7 @@ class PoseFreeGaussianSR(nn.Module):
 
     def _training_view_forward_eager(
         self,
-        base_intrinsics: Tensor,
-        render_intrinsics: Tensor,
+        render_intrinsics: tuple[Tensor, Tensor],
         R_cw: Tensor,
         t_cw: Tensor,
         target: Tensor,
@@ -716,7 +736,6 @@ class PoseFreeGaussianSR(nn.Module):
     ) -> tuple[Tensor, ...]:
         _field, viewmat, K, means3d, quat, scale, opacity, values, background, active_count = (
             self._prepare_render_payload(
-                base_intrinsics,
                 render_intrinsics,
                 R_cw,
                 t_cw,
@@ -742,8 +761,7 @@ class PoseFreeGaussianSR(nn.Module):
 
     def _training_view_forward_density_eager(
         self,
-        base_intrinsics: Tensor,
-        render_intrinsics: Tensor,
+        render_intrinsics: tuple[Tensor, Tensor],
         R_cw: Tensor,
         t_cw: Tensor,
         target: Tensor,
@@ -752,7 +770,6 @@ class PoseFreeGaussianSR(nn.Module):
     ) -> tuple[Tensor, ...]:
         _field, viewmat, K, means3d, quat, scale, opacity, values, background, active_count = (
             self._prepare_render_payload(
-                base_intrinsics,
                 render_intrinsics,
                 R_cw,
                 t_cw,
@@ -788,7 +805,6 @@ class PoseFreeGaussianSR(nn.Module):
         grad_clip: float,
     ) -> tuple[Tensor, ...]:
         opt.zero_grad(set_to_none=True)
-        base_intrinsics = self.intrinsics.get()
         render_intrinsics = self._scale_intrinsics(out_h, out_w)
         R_all, t_all = self.camera_model.world_to_camera()
         photo_loss = stage_targets.new_tensor(0.0)
@@ -796,7 +812,6 @@ class PoseFreeGaussianSR(nn.Module):
         pred_finite = torch.ones((), device=stage_targets.device, dtype=torch.bool)
         for view_index in range(self.num_views):
             train_view = self._training_view_forward_eager(
-                base_intrinsics,
                 render_intrinsics,
                 R_all[view_index],
                 t_all[view_index],
@@ -826,7 +841,6 @@ class PoseFreeGaussianSR(nn.Module):
         grad_clip: float,
     ) -> tuple[Tensor, ...]:
         opt.zero_grad(set_to_none=True)
-        base_intrinsics = self.intrinsics.get()
         render_intrinsics = self._scale_intrinsics(out_h, out_w)
         R_all, t_all = self.camera_model.world_to_camera()
         photo_loss = stage_targets.new_tensor(0.0)
@@ -836,7 +850,6 @@ class PoseFreeGaussianSR(nn.Module):
         meta_offset = 3 + len(_META_STAT_KEYS)
         for view_index in range(self.num_views):
             train_view = self._training_view_forward_density_eager(
-                base_intrinsics,
                 render_intrinsics,
                 R_all[view_index],
                 t_all[view_index],
@@ -896,14 +909,13 @@ class PoseFreeGaussianSR(nn.Module):
 
         device = stage_targets.device
         opt.zero_grad(set_to_none=True)
-        base_intrinsics = self.intrinsics.get()
         render_intrinsics = self._scale_intrinsics(out_h, out_w)
         R_all, t_all = self.camera_model.world_to_camera()
         renderer_cfg = self._renderer_config()
         num_views = self.num_views
 
         # --- Shared geometry from field model ---
-        field_v0 = self.field_model(base_intrinsics, R_cw=R_all[0], t_cw=t_all[0], padded=True)
+        field_v0 = self.field_model(R_cw=R_all[0], t_cw=t_all[0], padded=True)
         means3d = field_v0["means3d"]
         quat = field_v0["quat"]
         scale = field_v0["scale"]
@@ -919,12 +931,17 @@ class PoseFreeGaussianSR(nn.Module):
 
         # --- Batch project all views at once (vmap) ---
         viewmats = torch.stack([self._viewmat_from_pose(R_all[v], t_all[v]) for v in range(num_views)])
-        K = self._K_from_intrinsics(render_intrinsics)
+        K = self._K_from_intrinsics(*render_intrinsics)
         Ks = K.unsqueeze(0).expand(num_views, -1, -1).contiguous()
         batched_proj = project_gaussians_batched(
-            means=means3d_c, quat=quat_c, scale=scale_c,
-            viewmats=viewmats, Ks=Ks,
-            width=out_w, height=out_h, cfg=renderer_cfg,
+            means=means3d_c,
+            quat=quat_c,
+            scale=scale_c,
+            viewmats=viewmats,
+            Ks=Ks,
+            width=out_w,
+            height=out_h,
+            cfg=renderer_cfg,
         )
 
         # --- Per-view: SH RGB + sort ---
@@ -932,7 +949,7 @@ class PoseFreeGaussianSR(nn.Module):
         values_list = []
         opacity_list = []
         for v in range(num_views):
-            field_v = self.field_model(base_intrinsics, R_cw=R_all[v], t_cw=t_all[v], padded=True)
+            field_v = self.field_model(R_cw=R_all[v], t_cw=t_all[v], padded=True)
             rgb_v = field_v["rgb"]
             latent_v = field_v["latent"]
             assert rgb_v is not None and latent_v is not None
@@ -951,7 +968,10 @@ class PoseFreeGaussianSR(nn.Module):
                 depth_key=batched_proj.depth_key[v],
             )
             prepared = prepare_visibility_from_projection(
-                proj_v, width=out_w, height=out_h, cfg=renderer_cfg,
+                proj_v,
+                width=out_w,
+                height=out_h,
+                cfg=renderer_cfg,
             )
             prepared_list.append(prepared)
 
@@ -959,8 +979,13 @@ class PoseFreeGaussianSR(nn.Module):
 
         # --- Batched rasterize all V views in one kernel ---
         out_list, _final_T_list = _helion_batched_rasterize_forward_impl(
-            prepared_list, values_list, opacity_list,
-            background, out_w, out_h, renderer_cfg,
+            prepared_list,
+            values_list,
+            opacity_list,
+            background,
+            out_w,
+            out_h,
+            renderer_cfg,
         )
 
         # --- Per-view: postprocess + loss ---
@@ -1009,14 +1034,12 @@ class PoseFreeGaussianSR(nn.Module):
         field_s = 0.0
         render_s = 0.0
         aux_stats_s = 0.0
-        base_intr = self.intrinsics.get()
         if profile:
             self._sync_for_timing(timing_device)
             t0 = time.perf_counter()
         with torch.profiler.record_function("pipeline.render.prepare_field"):
             field, viewmat, K, means3d, quat, scale, opacity, values, background, active_count = (
                 self._prepare_render_payload(
-                    base_intr,
                     intr,
                     R_cw,
                     t_cw,
@@ -1138,12 +1161,10 @@ class PoseFreeGaussianSR(nn.Module):
         else:
             out_h, out_w = int(out_size[0]), int(out_size[1])
 
-        base_intrinsics = self.intrinsics.get()
         render_intrinsics = self._scale_intrinsics(out_h, out_w)
         R_all, t_all = self.camera_model.world_to_camera()
         _field, viewmat, K, means3d, quat, scale_render, _opacity, _values, _background, active_count = (
             self._prepare_render_payload_eager(
-                base_intrinsics,
                 render_intrinsics,
                 R_all[view_index],
                 t_all[view_index],
@@ -1167,7 +1188,6 @@ class PoseFreeGaussianSR(nn.Module):
         render_h: int,
         render_w: int,
     ) -> list[dict[str, object]]:
-        base_intrinsics = self.intrinsics.get()
         render_intrinsics = self._scale_intrinsics(render_h, render_w)
         R_all, t_all = self.camera_model.world_to_camera()
         renderer_cfg = self._renderer_config()
@@ -1175,7 +1195,6 @@ class PoseFreeGaussianSR(nn.Module):
         for view_index in view_ids:
             _field, viewmat, K, means3d, quat, scale_render, _opacity, _values, _background, active_count = (
                 self._prepare_render_payload_eager(
-                    base_intrinsics,
                     render_intrinsics,
                     R_all[view_index],
                     t_all[view_index],
@@ -1442,11 +1461,13 @@ class PoseFreeGaussianSR(nn.Module):
             ("opacity_logit", self.field_model.opacity_logit),
             ("rgb_logit", self.field_model.rgb_logit),
             ("latent", self.field_model.latent),
-            ("camera_pose", self.camera_model.pose_rest),
-            ("intrinsics_log_fx", self.intrinsics.log_fx),
-            ("intrinsics_log_fy", self.intrinsics.log_fy),
-            ("intrinsics_cx", self.intrinsics.cx),
-            ("intrinsics_cy", self.intrinsics.cy),
+            *(
+                [("camera_omega", self.camera_model.omega_rest), ("camera_trans", self.camera_model.trans_rest)]
+                if self.num_views > 1
+                else []
+            ),
+            ("intrinsics_log_focal", self.intrinsics.log_focal),
+            ("intrinsics_principal", self.intrinsics.principal),
         ]
         if getattr(self.field_model, "sh_coeffs", None) is not None:
             items.append(("sh_coeffs", self.field_model.sh_coeffs))
@@ -1755,7 +1776,6 @@ class PoseFreeGaussianSR(nn.Module):
                         rendered_any = True
                     else:
                         opt.zero_grad(set_to_none=True)
-                        base_intr = self.intrinsics.get()
                         intr = self._scale_intrinsics(render_h, render_w)
 
                         for view_pos, v in enumerate(view_ids):
@@ -1782,8 +1802,7 @@ class PoseFreeGaussianSR(nn.Module):
                                 tgt = stage_targets[v]
                                 view_R = R_all[v].detach() if stage_idx == (total_stages - 1) else R_all[v]
                                 view_t = t_all[v].detach() if stage_idx == (total_stages - 1) else t_all[v]
-                                view_intr = intr.detach() if stage_idx == (total_stages - 1) else intr
-                                view_base_intr = base_intr.detach() if stage_idx == (total_stages - 1) else base_intr
+                                view_intr = tuple(t.detach() for t in intr) if stage_idx == (total_stages - 1) else intr
                                 if (
                                     timing_enabled
                                     or debug_progress_enabled
@@ -1888,14 +1907,13 @@ class PoseFreeGaussianSR(nn.Module):
                                                 pred_rgb=pred.detach(),
                                                 R_cw=view_R.detach(),
                                                 t_cw=view_t.detach(),
-                                                intrinsics=view_intr.detach(),
+                                                intrinsics=torch.cat(tuple(t.detach() for t in view_intr)),
                                             )
                                         )
                                 else:
                                     with torch.profiler.record_function("pipeline.training_view_forward"):
                                         if density_due:
                                             train_view = self._training_view_forward_density(
-                                                view_base_intr,
                                                 view_intr,
                                                 view_R,
                                                 view_t,
@@ -1908,7 +1926,6 @@ class PoseFreeGaussianSR(nn.Module):
                                             stats_accum = self._accumulate_render_stats(stats_accum, residual_stats)
                                         else:
                                             train_view = self._training_view_forward(
-                                                view_base_intr,
                                                 view_intr,
                                                 view_R,
                                                 view_t,
@@ -1978,7 +1995,7 @@ class PoseFreeGaussianSR(nn.Module):
                                                 target_rgb=tgt.detach(),
                                                 R_cw=view_R.detach(),
                                                 t_cw=view_t.detach(),
-                                                intrinsics=view_intr.detach(),
+                                                intrinsics=torch.cat(tuple(t.detach() for t in view_intr)),
                                             )
                                         )
                                 rendered_any = True

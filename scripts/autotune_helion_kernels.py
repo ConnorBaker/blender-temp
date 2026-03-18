@@ -127,9 +127,14 @@ def autotune_forward_kernel(
 
     # Run projection to get realistic prepared visibility data.
     projection = project_gaussians_reference(
-        means=scene["means"], quat=scene["quat"], scale=scene["scale"],
-        viewmat=scene["viewmat"], K=scene["K"],
-        width=width, height=height, cfg=cfg,
+        means=scene["means"],
+        quat=scene["quat"],
+        scale=scene["scale"],
+        viewmat=scene["viewmat"],
+        K=scene["K"],
+        width=width,
+        height=height,
+        cfg=cfg,
     )
     prepared = prepare_visibility_from_projection(projection, width=width, height=height, cfg=cfg)
     prepared = _stabilize_prepared_visibility(prepared)
@@ -144,9 +149,12 @@ def autotune_forward_kernel(
             tile_start=prepared.tile_start,
             tile_end=prepared.tile_end,
             sorted_vals=prepared.sorted_vals,
-            width=prepared.width, height=prepared.height,
-            tile_size=prepared.tile_size, tiles_x=prepared.tiles_x,
-            tiles_y=prepared.tiles_y, tile_count=prepared.tile_count,
+            width=prepared.width,
+            height=prepared.height,
+            tile_size=prepared.tile_size,
+            tiles_x=prepared.tiles_x,
+            tiles_y=prepared.tiles_y,
+            tile_count=prepared.tile_count,
             gaussian_count_value=prepared.gaussian_count,
             intersection_count_value=prepared.intersection_count,
         )
@@ -168,7 +176,8 @@ def autotune_forward_kernel(
         prepared.tile_start.unsqueeze(0),
         prepared.tile_end.unsqueeze(0),
         prepared.sorted_vals.unsqueeze(0),
-        pixel_x, pixel_y,
+        pixel_x,
+        pixel_y,
         prepared.xys.contiguous().unsqueeze(0),
         prepared.conic.contiguous().unsqueeze(0),
         prepared.rho.unsqueeze(0),
@@ -177,11 +186,14 @@ def autotune_forward_kernel(
         scene["background"],
         tiles_per_view,  # total_tiles (V=1)
         tiles_per_view,
-        prepared.tiles_x, prepared.tile_size,
+        prepared.tiles_x,
+        prepared.tile_size,
         int(cfg.rasterize_mode == "antialiased"),
         bg_is_zero,
         _helion_raster_chunk_size(),
-        float(cfg.alpha_min), float(cfg.transmittance_eps), float(cfg.clamp_alpha_max),
+        float(cfg.alpha_min),
+        float(cfg.transmittance_eps),
+        float(cfg.clamp_alpha_max),
         pixels_per_view,
     )
 
@@ -224,9 +236,14 @@ def autotune_visibility_stats_kernel(
     values_dtype = scene["values"].dtype
 
     projection = project_gaussians_reference(
-        means=scene["means"], quat=scene["quat"], scale=scene["scale"],
-        viewmat=scene["viewmat"], K=scene["K"],
-        width=width, height=height, cfg=cfg,
+        means=scene["means"],
+        quat=scene["quat"],
+        scale=scene["scale"],
+        viewmat=scene["viewmat"],
+        K=scene["K"],
+        width=width,
+        height=height,
+        cfg=cfg,
     )
     prepared = prepare_visibility_from_projection(projection, width=width, height=height, cfg=cfg)
     prepared = _stabilize_prepared_visibility(prepared)
@@ -240,9 +257,12 @@ def autotune_visibility_stats_kernel(
             tile_start=prepared.tile_start,
             tile_end=prepared.tile_end,
             sorted_vals=prepared.sorted_vals,
-            width=prepared.width, height=prepared.height,
-            tile_size=prepared.tile_size, tiles_x=prepared.tiles_x,
-            tiles_y=prepared.tiles_y, tile_count=prepared.tile_count,
+            width=prepared.width,
+            height=prepared.height,
+            tile_size=prepared.tile_size,
+            tiles_x=prepared.tiles_x,
+            tiles_y=prepared.tiles_y,
+            tile_count=prepared.tile_count,
             gaussian_count_value=prepared.gaussian_count,
             intersection_count_value=prepared.intersection_count,
         )
@@ -262,7 +282,8 @@ def autotune_visibility_stats_kernel(
         prepared.tile_start.unsqueeze(0),
         prepared.tile_end.unsqueeze(0),
         prepared.sorted_vals.unsqueeze(0),
-        pixel_x, pixel_y,
+        pixel_x,
+        pixel_y,
         prepared.xys.contiguous().unsqueeze(0),
         prepared.conic.contiguous().unsqueeze(0),
         prepared.rho.unsqueeze(0),
@@ -270,11 +291,15 @@ def autotune_visibility_stats_kernel(
         residual_map.contiguous().unsqueeze(0),
         tiles_per_view,  # total_tiles (V=1)
         tiles_per_view,
-        prepared.tiles_x, prepared.tile_size,
+        prepared.tiles_x,
+        prepared.tile_size,
         int(cfg.rasterize_mode == "antialiased"),
         _helion_raster_chunk_size(),
-        bins, bins,
-        float(cfg.alpha_min), float(cfg.transmittance_eps), float(cfg.clamp_alpha_max),
+        bins,
+        bins,
+        float(cfg.alpha_min),
+        float(cfg.transmittance_eps),
+        float(cfg.clamp_alpha_max),
         prepared.gaussian_count,
     )
 
@@ -318,9 +343,14 @@ def autotune_backward_kernel(
     values_dtype = values.dtype
 
     projection = project_gaussians_reference(
-        means=scene["means"], quat=scene["quat"], scale=scene["scale"],
-        viewmat=scene["viewmat"], K=scene["K"],
-        width=width, height=height, cfg=cfg,
+        means=scene["means"],
+        quat=scene["quat"],
+        scale=scene["scale"],
+        viewmat=scene["viewmat"],
+        K=scene["K"],
+        width=width,
+        height=height,
+        cfg=cfg,
     )
     prepared = prepare_visibility_from_projection(projection, width=width, height=height, cfg=cfg)
     prepared = _stabilize_prepared_visibility(prepared)
@@ -334,9 +364,12 @@ def autotune_backward_kernel(
             tile_start=prepared.tile_start,
             tile_end=prepared.tile_end,
             sorted_vals=prepared.sorted_vals,
-            width=prepared.width, height=prepared.height,
-            tile_size=prepared.tile_size, tiles_x=prepared.tiles_x,
-            tiles_y=prepared.tiles_y, tile_count=prepared.tile_count,
+            width=prepared.width,
+            height=prepared.height,
+            tile_size=prepared.tile_size,
+            tiles_x=prepared.tiles_x,
+            tiles_y=prepared.tiles_y,
+            tile_count=prepared.tile_count,
             gaussian_count_value=prepared.gaussian_count,
             intersection_count_value=prepared.intersection_count,
         )
@@ -352,8 +385,13 @@ def autotune_backward_kernel(
     # Run batched forward (V=1) to get final_T for the backward.
     bg_is_zero = int(bool(torch.count_nonzero(scene["background"]).item() == 0))
     out_list, final_T_list = _helion_batched_rasterize_forward_impl(
-        [prepared], [values.contiguous()], [opacity],
-        scene["background"], width, height, cfg,
+        [prepared],
+        [values.contiguous()],
+        [opacity],
+        scene["background"],
+        width,
+        height,
+        cfg,
     )
     final_T = final_T_list[0]
 
@@ -366,7 +404,8 @@ def autotune_backward_kernel(
         prepared.tile_start.unsqueeze(0),
         prepared.tile_end.unsqueeze(0),
         prepared.sorted_vals.unsqueeze(0),
-        pixel_x, pixel_y,
+        pixel_x,
+        pixel_y,
         prepared.xys.contiguous().unsqueeze(0),
         prepared.conic.contiguous().unsqueeze(0),
         prepared.rho.unsqueeze(0),
@@ -377,11 +416,14 @@ def autotune_backward_kernel(
         grad_out.contiguous().view(-1).unsqueeze(0),
         tiles_per_view,  # total_tiles (V=1)
         tiles_per_view,
-        prepared.tiles_x, prepared.tile_size,
+        prepared.tiles_x,
+        prepared.tile_size,
         int(cfg.rasterize_mode == "antialiased"),
         bg_is_zero,
         _helion_raster_backward_chunk_size(),
-        float(cfg.alpha_min), float(cfg.transmittance_eps), float(cfg.clamp_alpha_max),
+        float(cfg.alpha_min),
+        float(cfg.transmittance_eps),
+        float(cfg.clamp_alpha_max),
         gaussian_count,
     )
 
@@ -413,7 +455,9 @@ def main() -> None:
     )
     parser.add_argument("--height", type=int, default=1080, help="Render height (default: 1080)")
     parser.add_argument("--width", type=int, default=1920, help="Render width (default: 1920)")
-    parser.add_argument("--channels", type=int, default=12, help="Value channels (default: 12 = 3 RGB + 8 latent + 1 alpha)")
+    parser.add_argument(
+        "--channels", type=int, default=12, help="Value channels (default: 12 = 3 RGB + 8 latent + 1 alpha)"
+    )
     parser.add_argument("--n-gaussians", type=int, default=65536, help="Number of Gaussians (default: 65536)")
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="float32", help="Values dtype")
     parser.add_argument("--screen-error-bins", type=int, default=4, help="Screen error bins for visibility stats")
@@ -469,7 +513,9 @@ def main() -> None:
             tuned.append(p)
 
     if "visibility" in args.kernels:
-        p = autotune_visibility_stats_kernel(scene, config_dir=config_dir, cfg=cfg, screen_error_bins=args.screen_error_bins)
+        p = autotune_visibility_stats_kernel(
+            scene, config_dir=config_dir, cfg=cfg, screen_error_bins=args.screen_error_bins
+        )
         if p:
             tuned.append(p)
 

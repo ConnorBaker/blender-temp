@@ -101,7 +101,7 @@ def default_intrinsics(
     device: torch.device,
     dtype: torch.dtype,
     init: CameraInit,
-) -> Tensor:
+) -> tuple[Tensor, Tensor]:
     if init.fx is None or init.fy is None:
         f = 0.5 * width / math.tan(0.5 * math.radians(init.default_fov_degrees))
         fx = f if init.fx is None else init.fx
@@ -111,7 +111,9 @@ def default_intrinsics(
         fy = init.fy
     cx = (width - 1.0) * 0.5 if init.cx is None else init.cx
     cy = (height - 1.0) * 0.5 if init.cy is None else init.cy
-    return torch.tensor([fx, fy, cx, cy], device=device, dtype=dtype)
+    focal = torch.tensor([fx, fy], device=device, dtype=dtype)
+    principal = torch.tensor([cx, cy], device=device, dtype=dtype)
+    return focal, principal
 
 
 __all__ = [

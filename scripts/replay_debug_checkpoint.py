@@ -171,7 +171,6 @@ def _run_replay(
             total_stages,
         )
         opt.zero_grad(set_to_none=True)
-        base_intr = pipeline.intrinsics.get()
         intr = pipeline._scale_intrinsics(render_h, render_w)
         R_all, t_all = pipeline.camera_model.world_to_camera()
 
@@ -250,7 +249,7 @@ def _run_replay(
                             pred_rgb=pred.detach(),
                             R_cw=R_all[view_idx].detach(),
                             t_cw=t_all[view_idx].detach(),
-                            intrinsics=intr.detach(),
+                            intrinsics=torch.cat(tuple(t.detach() for t in intr)),
                         )
                     )
                 else:
@@ -258,7 +257,6 @@ def _run_replay(
             else:
                 if density_due:
                     train_view = pipeline._training_view_forward_density(
-                        base_intr,
                         intr,
                         R_all[view_idx],
                         t_all[view_idx],
@@ -271,7 +269,6 @@ def _run_replay(
                     stats_accum = pipeline._accumulate_render_stats(stats_accum, residual_stats)
                 else:
                     train_view = pipeline._training_view_forward(
-                        base_intr,
                         intr,
                         R_all[view_idx],
                         t_all[view_idx],
@@ -317,7 +314,7 @@ def _run_replay(
                             target_rgb=tgt.detach(),
                             R_cw=R_all[view_idx].detach(),
                             t_cw=t_all[view_idx].detach(),
-                            intrinsics=intr.detach(),
+                            intrinsics=torch.cat(tuple(t.detach() for t in intr)),
                         )
                     )
             rendered_any = True

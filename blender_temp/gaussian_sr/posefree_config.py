@@ -132,14 +132,14 @@ class TrainConfig:
     # Position LR decays log-linearly; all others are constant per stage.
     # Values are higher than vanilla 3DGS (which starts from known poses)
     # because our pose-free setting needs faster initial convergence.
-    lr_position: float = 1.0e-3       # 3DGS uses 1.6e-4 (known poses)
+    lr_position: float = 1.0e-3  # 3DGS uses 1.6e-4 (known poses)
     lr_position_final: float = 1.0e-5  # 100x decay ratio matches 3DGS
-    lr_opacity: float = 5.0e-2         # 3DGS default
-    lr_scaling: float = 5.0e-3         # 3DGS default
-    lr_rotation: float = 1.0e-3        # 3DGS default
-    lr_color: float = 2.5e-3           # 3DGS features_dc default
-    lr_latent: float = 2.5e-3          # Same as color features
-    lr_sh: float = 1.25e-4             # 3DGS features_rest (features_dc / 20)
+    lr_opacity: float = 5.0e-2  # 3DGS default
+    lr_scaling: float = 5.0e-3  # 3DGS default
+    lr_rotation: float = 1.0e-3  # 3DGS default
+    lr_color: float = 2.5e-3  # 3DGS features_dc default
+    lr_latent: float = 2.5e-3  # Same as color features
+    lr_sh: float = 1.25e-4  # 3DGS features_rest (features_dc / 20)
     lr_camera: float = 2.0e-3
     lr_residual: float = 1.0e-3
     photometric_l1_weight: float = 0.8

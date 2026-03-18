@@ -211,10 +211,13 @@ def test_constant_appearance_pipeline_produces_finite_camera_geometry_gradients(
     loss = out["rgb"].sum()
     loss.backward()
 
-    grad = pipeline.camera_model.pose_rest.grad
-    assert grad is not None
-    assert torch.isfinite(grad).all()
-    assert float(grad.abs().sum().item()) > 0.0
+    omega_grad = pipeline.camera_model.omega_rest.grad
+    trans_grad = pipeline.camera_model.trans_rest.grad
+    assert omega_grad is not None
+    assert trans_grad is not None
+    assert torch.isfinite(omega_grad).all()
+    assert torch.isfinite(trans_grad).all()
+    assert float(omega_grad.abs().sum().item()) + float(trans_grad.abs().sum().item()) > 0.0
 
 
 def test_fit_skips_density_control_calls_in_final_stage_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -323,8 +326,7 @@ def test_fit_skips_density_control_calls_in_final_stage_when_disabled(monkeypatc
         )
 
     def fake_training_view_forward(
-        _base_intrinsics: torch.Tensor,
-        _render_intrinsics: torch.Tensor,
+        _render_intrinsics: tuple[torch.Tensor, torch.Tensor],
         _R_cw: torch.Tensor,
         _t_cw: torch.Tensor,
         _target: torch.Tensor,
@@ -381,8 +383,7 @@ def test_render_with_pose_meta_stats_prepares_once_and_skips_full_stats(monkeypa
     call_order: list[tuple[str, object]] = []
 
     def fake_prepare_render_payload(
-        _base_intrinsics: torch.Tensor,
-        _render_intrinsics: torch.Tensor,
+        _render_intrinsics: tuple[torch.Tensor, torch.Tensor],
         _R_cw: torch.Tensor,
         _t_cw: torch.Tensor,
     ):
@@ -433,8 +434,8 @@ def test_render_with_pose_meta_stats_prepares_once_and_skips_full_stats(monkeypa
 
     monkeypatch.setattr(pipeline, "_prepare_render_payload", fake_prepare_render_payload)
     monkeypatch.setattr(pipeline, "_postprocess_rgb", fake_postprocess_rgb)
-    monkeypatch.setattr(pipeline_module, "render_values_warp", fake_render_values_warp)
-    monkeypatch.setattr(pipeline_module, "render_stats_prepared_warp", fail_render_stats_prepared_warp)
+    monkeypatch.setattr(pipeline_module, "render_values", fake_render_values_warp)
+    monkeypatch.setattr(pipeline_module, "render_stats_prepared", fail_render_stats_prepared_warp)
 
     out = pipeline.render_with_pose(
         torch.eye(3, dtype=torch.float32),
@@ -511,8 +512,7 @@ def test_fit_progress_callback_does_not_enable_sync_profile_and_step_callback_ru
         return pipeline.field_model.means3d.sum() * 0.0
 
     def fake_training_view_forward(
-        _base_intrinsics: torch.Tensor,
-        _render_intrinsics: torch.Tensor,
+        _render_intrinsics: tuple[torch.Tensor, torch.Tensor],
         _R_cw: torch.Tensor,
         _t_cw: torch.Tensor,
         _target: torch.Tensor,
@@ -586,24 +586,30 @@ def test_rebuild_optimizer_after_density_preserves_optimizer_when_field_storage_
     pipeline = PoseFreeGaussianSR.from_images(images, intrinsics=None, config=cfg)
     opt = pipeline._make_optimizer(cfg.train)
 
-    for param in opt.param_groups[0]["params"]:
-        opt.state[param] = {
-            "step": torch.tensor(7.0),
-            "exp_avg": torch.full_like(param, 3.0),
-            "exp_avg_sq": torch.full_like(param, 5.0),
-        }
+    # Seed all field param groups with known state
+    field_groups = [pg for pg in opt.param_groups if pg.get("name") not in ("camera", "intrinsics", "residual")]
+    for pg in field_groups:
+        for param in pg["params"]:
+            opt.state[param] = {
+                "step": torch.tensor(7.0),
+                "exp_avg": torch.full_like(param, 3.0),
+                "exp_avg_sq": torch.full_like(param, 5.0),
+            }
 
-    camera_param = opt.param_groups[1]["params"][0]
-    camera_state = {
-        "step": torch.tensor(11.0),
-        "exp_avg": torch.full_like(camera_param, 2.0),
-        "exp_avg_sq": torch.full_like(camera_param, 4.0),
-    }
-    opt.state[camera_param] = {
-        "step": camera_state["step"].clone(),
-        "exp_avg": camera_state["exp_avg"].clone(),
-        "exp_avg_sq": camera_state["exp_avg_sq"].clone(),
-    }
+    camera_group = next(pg for pg in opt.param_groups if pg.get("name") == "camera")
+    camera_params = camera_group["params"]
+    camera_states = {}
+    for cp in camera_params:
+        camera_states[cp] = {
+            "step": torch.tensor(11.0),
+            "exp_avg": torch.full_like(cp, 2.0),
+            "exp_avg_sq": torch.full_like(cp, 4.0),
+        }
+        opt.state[cp] = {
+            "step": camera_states[cp]["step"].clone(),
+            "exp_avg": camera_states[cp]["exp_avg"].clone(),
+            "exp_avg_sq": camera_states[cp]["exp_avg_sq"].clone(),
+        }
 
     before = pipeline.field_model.num_gaussians
     pipeline.field_model.clone_gaussians(torch.tensor([0], dtype=torch.long))
@@ -615,9 +621,10 @@ def test_rebuild_optimizer_after_density_preserves_optimizer_when_field_storage_
     )
 
     assert rebuilt is opt
-    assert rebuilt.state[camera_param]["step"].item() == camera_state["step"].item()
-    assert torch.equal(rebuilt.state[camera_param]["exp_avg"], camera_state["exp_avg"])
-    assert torch.equal(rebuilt.state[camera_param]["exp_avg_sq"], camera_state["exp_avg_sq"])
+    for cp in camera_params:
+        assert rebuilt.state[cp]["step"].item() == camera_states[cp]["step"].item()
+        assert torch.equal(rebuilt.state[cp]["exp_avg"], camera_states[cp]["exp_avg"])
+        assert torch.equal(rebuilt.state[cp]["exp_avg_sq"], camera_states[cp]["exp_avg_sq"])
 
     field_param = rebuilt.param_groups[0]["params"][0]
     assert field_param is pipeline.field_model.means3d
@@ -757,8 +764,7 @@ def test_post_density_projection_preflight_runs_after_density_event(monkeypatch:
         return pipeline.field_model.means3d.sum() * 0.0
 
     def fake_training_view_forward(
-        _base_intrinsics: torch.Tensor,
-        _render_intrinsics: torch.Tensor,
+        _render_intrinsics: tuple[torch.Tensor, torch.Tensor],
         _R_cw: torch.Tensor,
         _t_cw: torch.Tensor,
         _target: torch.Tensor,
