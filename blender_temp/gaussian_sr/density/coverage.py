@@ -61,6 +61,8 @@ def _weak_view_indices(
     error_fraction_of_worst: Tensor | None,
     cfg: DensityControlConfig,
 ) -> tuple[int, ...]:
+    if not view_coverages:
+        return ()
     min_visible_abs = int(cfg.min_view_visible_gaussians)
     min_intersections_abs = int(cfg.min_view_intersection_count)
     min_visible_rel = max(float(cfg.min_view_visible_fraction_of_best), float(cfg.coverage_floor_visible_fraction))
@@ -68,21 +70,20 @@ def _weak_view_indices(
         float(cfg.min_view_intersection_fraction_of_best),
         float(cfg.coverage_floor_intersection_fraction),
     )
-    weak_views: list[int] = []
-    for idx, coverage in enumerate(view_coverages):
-        visible_too_low = (
-            coverage.visible_count < min_visible_abs or float(visible_fraction_of_best[idx].item()) < min_visible_rel
-        )
-        intersections_too_low = (
-            coverage.intersection_count < min_intersections_abs
-            or float(intersection_fraction_of_best[idx].item()) < min_intersections_rel
-        )
-        error_high = True
-        if error_fraction_of_worst is not None and error_fraction_of_worst.numel() > idx:
-            error_high = float(error_fraction_of_worst[idx].item()) >= float(cfg.weak_view_error_fraction_of_worst)
-        if (visible_too_low or intersections_too_low) and error_high:
-            weak_views.append(int(coverage.view_index))
-    return tuple(weak_views)
+    device = visible_fraction_of_best.device
+    V = len(view_coverages)
+    visible_counts = torch.tensor([c.visible_count for c in view_coverages], device=device, dtype=torch.long)
+    intersection_counts = torch.tensor([c.intersection_count for c in view_coverages], device=device, dtype=torch.long)
+    visible_too_low = (visible_counts < min_visible_abs) | (visible_fraction_of_best < min_visible_rel)
+    intersections_too_low = (intersection_counts < min_intersections_abs) | (
+        intersection_fraction_of_best < min_intersections_rel
+    )
+    error_high = torch.ones(V, dtype=torch.bool, device=device)
+    if error_fraction_of_worst is not None:
+        n = min(error_fraction_of_worst.numel(), V)
+        error_high[:n] = error_fraction_of_worst[:n] >= float(cfg.weak_view_error_fraction_of_worst)
+    mask = (visible_too_low | intersections_too_low) & error_high
+    return tuple(int(view_coverages[i].view_index) for i in mask.nonzero(as_tuple=False).squeeze(-1).tolist())
 
 
 def _reseed_view_indices(
@@ -95,7 +96,9 @@ def _reseed_view_indices(
     cfg: DensityControlConfig,
 ) -> tuple[int, ...]:
     if int(cfg.weak_view_reseed_budget_per_view) <= 0:
-        return tuple()
+        return ()
+    if not view_coverages:
+        return tuple(int(v) for v in weak_view_indices)
 
     trigger_rel = max(
         float(cfg.weak_view_reseed_trigger_fraction_of_best),
@@ -104,22 +107,20 @@ def _reseed_view_indices(
         float(cfg.coverage_floor_visible_fraction),
         float(cfg.coverage_floor_intersection_fraction),
     )
-    reseed_views: list[int] = []
-    seen: set[int] = set()
-    for view_index in weak_view_indices:
-        view_id = int(view_index)
-        reseed_views.append(view_id)
-        seen.add(view_id)
-    for idx, coverage in enumerate(view_coverages):
-        view_id = int(coverage.view_index)
-        if view_id in seen:
-            continue
-        visible_lagging = float(visible_fraction_of_best[idx].item()) < trigger_rel
-        intersections_lagging = float(intersection_fraction_of_best[idx].item()) < trigger_rel
-        error_high = True
-        if error_fraction_of_worst is not None and error_fraction_of_worst.numel() > idx:
-            error_high = float(error_fraction_of_worst[idx].item()) >= float(cfg.weak_view_error_fraction_of_worst)
-        if (visible_lagging or intersections_lagging) and error_high:
+    reseed_views: list[int] = [int(v) for v in weak_view_indices]
+    seen: set[int] = set(reseed_views)
+    device = visible_fraction_of_best.device
+    V = len(view_coverages)
+    visible_lagging = visible_fraction_of_best < trigger_rel
+    intersections_lagging = intersection_fraction_of_best < trigger_rel
+    error_high = torch.ones(V, dtype=torch.bool, device=device)
+    if error_fraction_of_worst is not None:
+        n = min(error_fraction_of_worst.numel(), V)
+        error_high[:n] = error_fraction_of_worst[:n] >= float(cfg.weak_view_error_fraction_of_worst)
+    lagging_mask = (visible_lagging | intersections_lagging) & error_high
+    for idx in lagging_mask.nonzero(as_tuple=False).squeeze(-1).tolist():
+        view_id = int(view_coverages[idx].view_index)
+        if view_id not in seen:
             reseed_views.append(view_id)
             seen.add(view_id)
     return tuple(reseed_views)
@@ -137,34 +138,25 @@ def _weighted_render_stats(
         return NormalizedRenderStats.zeros(count, device, dtype)
     if weights.numel() == 0:
         weights = torch.ones(len(stats_list), device=device, dtype=dtype)
-    w = weights / weights.sum().clamp_min(1.0e-8)
-    contrib = torch.zeros(count, device=device, dtype=dtype)
-    hits = torch.zeros(count, device=device, dtype=dtype)
-    avg_trans = torch.zeros(count, device=device, dtype=dtype)
-    avg_contrib = torch.zeros(count, device=device, dtype=dtype)
-    residual = torch.zeros(count, device=device, dtype=dtype)
-    avg_residual = torch.zeros(count, device=device, dtype=dtype)
-    peak_error = torch.zeros(count, device=device, dtype=dtype)
-    error_map = torch.zeros(count, stats_list[0].error_map.shape[-1], device=device, dtype=dtype)
-    for idx, stats in enumerate(stats_list):
-        weight = w[idx]
-        contrib = contrib + weight * stats.contrib
-        hits = hits + weight * stats.hits
-        avg_trans = avg_trans + weight * stats.avg_trans
-        avg_contrib = avg_contrib + weight * stats.avg_contrib
-        residual = residual + weight * stats.residual
-        avg_residual = avg_residual + weight * stats.avg_residual
-        peak_error = peak_error + weight * stats.peak_error
-        error_map = error_map + weight * stats.error_map
+    w = weights / weights.sum().clamp_min(1.0e-8)  # [V]
+    contrib_stack = torch.stack([s.contrib for s in stats_list], dim=0)  # [V, N]
+    hits_stack = torch.stack([s.hits for s in stats_list], dim=0)
+    avg_trans_stack = torch.stack([s.avg_trans for s in stats_list], dim=0)
+    avg_contrib_stack = torch.stack([s.avg_contrib for s in stats_list], dim=0)
+    residual_stack = torch.stack([s.residual for s in stats_list], dim=0)
+    avg_residual_stack = torch.stack([s.avg_residual for s in stats_list], dim=0)
+    peak_error_stack = torch.stack([s.peak_error for s in stats_list], dim=0)
+    error_map_stack = torch.stack([s.error_map for s in stats_list], dim=0)  # [V, N, B]
+    w1 = w[:, None]  # [V, 1] for broadcasting over [V, N]
     return NormalizedRenderStats(
-        contrib=contrib,
-        hits=hits,
-        avg_trans=avg_trans,
-        avg_contrib=avg_contrib,
-        residual=residual,
-        avg_residual=avg_residual,
-        error_map=error_map,
-        peak_error=peak_error,
+        contrib=(w1 * contrib_stack).sum(dim=0),
+        hits=(w1 * hits_stack).sum(dim=0),
+        avg_trans=(w1 * avg_trans_stack).sum(dim=0),
+        avg_contrib=(w1 * avg_contrib_stack).sum(dim=0),
+        residual=(w1 * residual_stack).sum(dim=0),
+        avg_residual=(w1 * avg_residual_stack).sum(dim=0),
+        peak_error=(w1 * peak_error_stack).sum(dim=0),
+        error_map=(w[:, None, None] * error_map_stack).sum(dim=0),
     )
 
 

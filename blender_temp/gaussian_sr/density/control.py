@@ -133,20 +133,12 @@ def apply_density_control(
         split_score = split_score[keep]
         clone_score = clone_score[keep]
         if view_ctx is not None:
-            view_ctx = ViewAwareDensityContext(
+            view_ctx = replace(
+                view_ctx,
                 weighted_stats=view_ctx.weighted_stats.masked(keep),
                 weak_view_stats=view_ctx.weak_view_stats.masked(keep),
                 min_contrib=view_ctx.min_contrib[keep],
                 min_trans=view_ctx.min_trans[keep],
-                coverage_weights=view_ctx.coverage_weights,
-                visible_fraction_of_best=view_ctx.visible_fraction_of_best,
-                intersection_fraction_of_best=view_ctx.intersection_fraction_of_best,
-                weak_view_indices=view_ctx.weak_view_indices,
-                reseed_view_indices=view_ctx.reseed_view_indices,
-                can_prune=view_ctx.can_prune,
-                view_coverages=view_ctx.view_coverages,
-                weak_observations=view_ctx.weak_observations,
-                reseed_observations=view_ctx.reseed_observations,
             )
 
     survivor_sources = source_indices.clone()

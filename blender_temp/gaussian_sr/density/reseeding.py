@@ -37,14 +37,26 @@ def _select_reseed_pixels(
     if match_radius_px <= 0.0 or candidate_idx.numel() <= budget:
         return candidate_idx[:budget].to(torch.long)
 
-    px = (candidate_idx % width).tolist()
-    py = (candidate_idx // width).tolist()
+    px = candidate_idx % width
+    py = candidate_idx // width
     radius2 = float(match_radius_px) * float(match_radius_px)
+    kept_px = torch.empty(budget, device=flat_residual.device, dtype=px.dtype)
+    kept_py = torch.empty(budget, device=flat_residual.device, dtype=py.dtype)
     keep_positions: list[int] = []
-    for pos, (x, y) in enumerate(zip(px, py)):
-        if all(((x - px[prev]) ** 2 + (y - py[prev]) ** 2) > radius2 for prev in keep_positions):
+    n_kept = 0
+    for pos in range(candidate_idx.numel()):
+        if n_kept == 0:
+            kept_px[0], kept_py[0] = px[pos], py[pos]
             keep_positions.append(pos)
-            if len(keep_positions) >= budget:
+            n_kept = 1
+            continue
+        dx = px[pos] - kept_px[:n_kept]
+        dy = py[pos] - kept_py[:n_kept]
+        if (dx * dx + dy * dy > radius2).all():
+            kept_px[n_kept], kept_py[n_kept] = px[pos], py[pos]
+            keep_positions.append(pos)
+            n_kept += 1
+            if n_kept >= budget:
                 break
     if not keep_positions:
         return candidate_idx[:budget].to(torch.long)
@@ -156,8 +168,7 @@ def _reseed_for_observation(
             visible_uv = visible_uv[in_bounds]
             visible_depths = visible_depths[in_bounds]
         if visible_uv.numel() > 0:
-            diff = cand_uv[:, None, :] - visible_uv[None, :, :]
-            dist2 = (diff * diff).sum(dim=-1)
+            dist2 = torch.cdist(cand_uv, visible_uv).square()
             nearest = dist2.argmin(dim=1)
             nearest_depth = visible_depths[nearest]
             nearest_dist2 = dist2.gather(1, nearest[:, None]).squeeze(1)
@@ -173,8 +184,8 @@ def _reseed_for_observation(
     world_pts = (cam_pts - t_cw.unsqueeze(0)) @ R_cw
 
     rgb = target_rgb[:, py.long(), px.long()].permute(1, 0).contiguous()
-    sx = field_model.field_cfg.init_scale_xy * depth_init / max(float(fx.item()), 1.0)
-    sy = field_model.field_cfg.init_scale_xy * depth_init / max(float(fy.item()), 1.0)
+    sx = field_model.field_cfg.init_scale_xy * depth_init / fx.clamp_min(1.0)
+    sy = field_model.field_cfg.init_scale_xy * depth_init / fy.clamp_min(1.0)
     sz = field_model.field_cfg.init_scale_z * depth_init
     scale = torch.stack((sx, sy, sz), dim=-1)
     opacity = torch.full(

@@ -16,20 +16,18 @@ def _topk_debug(indices: Tensor, score: Tensor, stats: NormalizedRenderStats, to
     vals = score[indices]
     order = torch.argsort(vals, descending=True)
     sel = indices[order[:topk]]
-    out: list[DensityDebugEntry] = []
-    for i in sel.tolist():
-        peak_bin = int(stats.error_map[i].argmax().item()) if stats.error_map.ndim == 2 else 0
-        out.append(
-            DensityDebugEntry(
-                index=int(i),
-                score=float(score[i].item()),
-                peak_bin=peak_bin,
-                peak_error=float(stats.peak_error[i].item()),
-                residual=float(stats.avg_residual[i].item()),
-                visibility=float(stats.contrib[i].item()),
-            )
+    peak_bins = stats.error_map[sel].argmax(dim=1).tolist() if stats.error_map.ndim == 2 else [0] * sel.numel()
+    return [
+        DensityDebugEntry(index=i, score=s, peak_bin=pb, peak_error=pe, residual=r, visibility=v)
+        for i, s, pb, pe, r, v in zip(
+            sel.tolist(),
+            score[sel].tolist(),
+            peak_bins,
+            stats.peak_error[sel].tolist(),
+            stats.avg_residual[sel].tolist(),
+            stats.contrib[sel].tolist(),
         )
-    return out
+    ]
 
 
 def build_density_debug_summary(
