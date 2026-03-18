@@ -111,7 +111,9 @@ def autotune_forward_kernel(
     """Autotune the raster forward kernel and save the config."""
     from blender_temp.gaussian_sr.helion_gsplat_renderer import (
         _helion_raster_chunk_size,
-        _make_raster_forward_kernel,
+        _make_batched_raster_forward_kernel,
+        _pad_rows,
+        _pad_vector,
         _stabilize_prepared_visibility,
     )
     from blender_temp.gaussian_sr.reference_renderer import project_gaussians_reference
@@ -158,31 +160,43 @@ def autotune_forward_kernel(
     pixel_y = torch.arange(height, device=device, dtype=torch.float32) + 0.5
 
     bg_is_zero = int(bool(torch.count_nonzero(scene["background"]).item() == 0))
+    tiles_per_view = prepared.tile_count
+    pixels_per_view = height * width
+
+    # Wrap single-view data as V=1 batched tensors.
     args = (
-        prepared.tile_start, prepared.tile_end, prepared.sorted_vals,
+        prepared.tile_start.unsqueeze(0),
+        prepared.tile_end.unsqueeze(0),
+        prepared.sorted_vals.unsqueeze(0),
         pixel_x, pixel_y,
-        prepared.xys.contiguous(), prepared.conic.contiguous(), prepared.rho,
-        values.contiguous(), opacity,
+        prepared.xys.contiguous().unsqueeze(0),
+        prepared.conic.contiguous().unsqueeze(0),
+        prepared.rho.unsqueeze(0),
+        values.contiguous().view(-1).unsqueeze(0),
+        opacity.unsqueeze(0),
         scene["background"],
+        tiles_per_view,  # total_tiles (V=1)
+        tiles_per_view,
         prepared.tiles_x, prepared.tile_size,
         int(cfg.rasterize_mode == "antialiased"),
         bg_is_zero,
         _helion_raster_chunk_size(),
         float(cfg.alpha_min), float(cfg.transmittance_eps), float(cfg.clamp_alpha_max),
+        pixels_per_view,
     )
 
-    LOGGER.info("Autotuning raster_forward (h=%d w=%d c=%d dtype=%s)...", height, width, channels, values_dtype)
+    LOGGER.info("Autotuning batched_raster_forward (h=%d w=%d c=%d dtype=%s)...", height, width, channels, values_dtype)
     intersection_count = prepared.intersection_count
     LOGGER.info("  Scene: %d Gaussians, %d intersections", prepared.gaussian_count, intersection_count)
 
-    kernel = _make_raster_forward_kernel(static_shapes=True, runtime_autotune=True)
+    kernel = _make_batched_raster_forward_kernel(static_shapes=True, runtime_autotune=True)
     t0 = time.perf_counter()
     best_config = kernel.autotune(args)
     elapsed = time.perf_counter() - t0
     LOGGER.info("  Best config found in %.1fs", elapsed)
 
     dtype_tag = "bf16" if values_dtype == torch.bfloat16 else "fp32"
-    filename = f"raster_forward_h{height}_w{width}_c{channels}_{dtype_tag}.json"
+    filename = f"batched_raster_forward_h{height}_w{width}_c{channels}_{dtype_tag}.json"
     out_path = config_dir / filename
     best_config.save(str(out_path))
     LOGGER.info("  Saved: %s", out_path)
@@ -243,16 +257,25 @@ def autotune_visibility_stats_kernel(
     residual_map = torch.rand(height, width, device=device, dtype=torch.float32)
     bins = max(int(screen_error_bins), 1)
 
+    tiles_per_view = prepared.tile_count
     args = (
-        prepared.tile_start, prepared.tile_end, prepared.sorted_vals,
+        prepared.tile_start.unsqueeze(0),
+        prepared.tile_end.unsqueeze(0),
+        prepared.sorted_vals.unsqueeze(0),
         pixel_x, pixel_y,
-        prepared.xys.contiguous(), prepared.conic.contiguous(), prepared.rho,
-        opacity.contiguous(), residual_map.contiguous(),
+        prepared.xys.contiguous().unsqueeze(0),
+        prepared.conic.contiguous().unsqueeze(0),
+        prepared.rho.unsqueeze(0),
+        opacity.contiguous().unsqueeze(0),
+        residual_map.contiguous().unsqueeze(0),
+        tiles_per_view,  # total_tiles (V=1)
+        tiles_per_view,
         prepared.tiles_x, prepared.tile_size,
         int(cfg.rasterize_mode == "antialiased"),
         _helion_raster_chunk_size(),
         bins, bins,
         float(cfg.alpha_min), float(cfg.transmittance_eps), float(cfg.clamp_alpha_max),
+        prepared.gaussian_count,
     )
 
     LOGGER.info("Autotuning visibility_stats (h=%d w=%d bins=%d dtype=%s)...", height, width, bins, values_dtype)
@@ -280,10 +303,9 @@ def autotune_backward_kernel(
 ) -> Path | None:
     """Autotune the raster backward kernel and save the config."""
     from blender_temp.gaussian_sr.helion_gsplat_renderer import (
+        _helion_batched_rasterize_forward_impl,
         _helion_raster_backward_chunk_size,
-        _helion_raster_chunk_size,
         _make_raster_backward_kernel,
-        _make_raster_forward_kernel,
         _stabilize_prepared_visibility,
     )
     from blender_temp.gaussian_sr.reference_renderer import project_gaussians_reference
@@ -327,38 +349,40 @@ def autotune_backward_kernel(
     pixel_x = torch.arange(width, device=device, dtype=torch.float32) + 0.5
     pixel_y = torch.arange(height, device=device, dtype=torch.float32) + 0.5
 
-    # Run forward to get final_T for the backward.
-    fwd_kernel = _make_raster_forward_kernel(static_shapes=True, runtime_autotune=False)
+    # Run batched forward (V=1) to get final_T for the backward.
     bg_is_zero = int(bool(torch.count_nonzero(scene["background"]).item() == 0))
-    _out, final_T, _stop_idx = fwd_kernel(
-        prepared.tile_start, prepared.tile_end, prepared.sorted_vals,
-        pixel_x, pixel_y,
-        prepared.xys.contiguous(), prepared.conic.contiguous(), prepared.rho,
-        values.contiguous(), opacity,
-        scene["background"],
-        prepared.tiles_x, prepared.tile_size,
-        int(cfg.rasterize_mode == "antialiased"),
-        bg_is_zero,
-        _helion_raster_chunk_size(),
-        float(cfg.alpha_min), float(cfg.transmittance_eps), float(cfg.clamp_alpha_max),
+    out_list, final_T_list = _helion_batched_rasterize_forward_impl(
+        [prepared], [values.contiguous()], [opacity],
+        scene["background"], width, height, cfg,
     )
+    final_T = final_T_list[0]
 
     # Synthetic grad_out in the same dtype as values.
     grad_out = torch.rand(height, width, channels, device=device, dtype=values_dtype)
+    tiles_per_view = prepared.tile_count
+    gaussian_count = prepared.gaussian_count
 
     args = (
-        prepared.tile_start, prepared.tile_end, prepared.sorted_vals,
+        prepared.tile_start.unsqueeze(0),
+        prepared.tile_end.unsqueeze(0),
+        prepared.sorted_vals.unsqueeze(0),
         pixel_x, pixel_y,
-        prepared.xys.contiguous(), prepared.conic.contiguous(), prepared.rho,
-        values.contiguous(), opacity,
+        prepared.xys.contiguous().unsqueeze(0),
+        prepared.conic.contiguous().unsqueeze(0),
+        prepared.rho.unsqueeze(0),
+        values.contiguous().view(-1).unsqueeze(0),
+        opacity.unsqueeze(0),
         scene["background"],
-        final_T.view(-1),
-        grad_out.contiguous().view(-1),
+        final_T.view(-1).unsqueeze(0),
+        grad_out.contiguous().view(-1).unsqueeze(0),
+        tiles_per_view,  # total_tiles (V=1)
+        tiles_per_view,
         prepared.tiles_x, prepared.tile_size,
         int(cfg.rasterize_mode == "antialiased"),
         bg_is_zero,
         _helion_raster_backward_chunk_size(),
         float(cfg.alpha_min), float(cfg.transmittance_eps), float(cfg.clamp_alpha_max),
+        gaussian_count,
     )
 
     LOGGER.info("Autotuning raster_backward (h=%d w=%d c=%d dtype=%s)...", height, width, channels, values_dtype)

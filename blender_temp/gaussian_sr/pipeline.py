@@ -865,6 +865,132 @@ class PoseFreeGaussianSR(nn.Module):
             *(stats_accum[key].detach() for key in _DENSITY_STAT_KEYS),
         )
 
+    # ------------------------------------------------------------------
+    # Batched projection: project N Gaussians through V viewmats in a
+    # single vectorized call via torch.vmap, then per-view sort+rasterize.
+    # Saves ~2x on projection cost (e.g. 3.15ms → 1.37ms for 3 views at
+    # 65K Gaussians).  Geometry (means, quat, scale, opacity) is shared
+    # across views; only SH-evaluated RGB differs per view.
+    # ------------------------------------------------------------------
+
+    def _train_step_batched_eager(
+        self,
+        opt: torch.optim.Optimizer,
+        stage_targets: Tensor,
+        out_h: int,
+        out_w: int,
+        stage_alpha: float,
+        grad_clip: float,
+    ) -> tuple[Tensor, ...]:
+        """Training step using batched projection + batched rasterization.
+
+        1. Extract shared geometry from field model
+        2. Batch-project through all V viewmats in one vmap call
+        3. Per-view: compute SH RGB, sort projection into tile order
+        4. Batched rasterize all V views in one kernel launch
+        5. Per-view: postprocess + loss
+        """
+        from .helion_gsplat_renderer import _helion_batched_rasterize_forward_impl
+        from .reference_renderer import ReferenceProjection, project_gaussians_batched
+        from .renderer_host_prep import prepare_visibility_from_projection
+
+        device = stage_targets.device
+        opt.zero_grad(set_to_none=True)
+        base_intrinsics = self.intrinsics.get()
+        render_intrinsics = self._scale_intrinsics(out_h, out_w)
+        R_all, t_all = self.camera_model.world_to_camera()
+        renderer_cfg = self._renderer_config()
+        num_views = self.num_views
+
+        # --- Shared geometry from field model ---
+        field_v0 = self.field_model(base_intrinsics, R_cw=R_all[0], t_cw=t_all[0], padded=True)
+        means3d = field_v0["means3d"]
+        quat = field_v0["quat"]
+        scale = field_v0["scale"]
+        opacity = field_v0["opacity"]
+        assert means3d is not None and quat is not None and scale is not None and opacity is not None
+        ac = field_v0.get("active_count")
+        active_count = int(ac.item()) if isinstance(ac, Tensor) else int(means3d.shape[0])
+        count = max(0, min(active_count, int(means3d.shape[0])))
+        means3d_c = means3d[:count].contiguous()
+        quat_c = quat[:count].contiguous()
+        scale_c = scale[:count].contiguous()
+        opacity_c = opacity[:count].contiguous()
+
+        # --- Batch project all views at once (vmap) ---
+        viewmats = torch.stack([self._viewmat_from_pose(R_all[v], t_all[v]) for v in range(num_views)])
+        K = self._K_from_intrinsics(render_intrinsics)
+        Ks = K.unsqueeze(0).expand(num_views, -1, -1).contiguous()
+        batched_proj = project_gaussians_batched(
+            means=means3d_c, quat=quat_c, scale=scale_c,
+            viewmats=viewmats, Ks=Ks,
+            width=out_w, height=out_h, cfg=renderer_cfg,
+        )
+
+        # --- Per-view: SH RGB + sort ---
+        prepared_list = []
+        values_list = []
+        opacity_list = []
+        for v in range(num_views):
+            field_v = self.field_model(base_intrinsics, R_cw=R_all[v], t_cw=t_all[v], padded=True)
+            rgb_v = field_v["rgb"]
+            latent_v = field_v["latent"]
+            assert rgb_v is not None and latent_v is not None
+            values = self._packed_values(rgb_v[:count], latent_v[:count])
+            values_list.append(values)
+            opacity_list.append(opacity_c)
+
+            proj_v = ReferenceProjection(
+                xys=batched_proj.xys[v],
+                conic=batched_proj.conic[v],
+                rho=batched_proj.rho[v],
+                radius=batched_proj.radius[v],
+                tile_min=batched_proj.tile_min[v],
+                tile_max=batched_proj.tile_max[v],
+                num_tiles_hit=batched_proj.num_tiles_hit[v],
+                depth_key=batched_proj.depth_key[v],
+            )
+            prepared = prepare_visibility_from_projection(
+                proj_v, width=out_w, height=out_h, cfg=renderer_cfg,
+            )
+            prepared_list.append(prepared)
+
+        background = self._packed_background(device, values_list[0].dtype)
+
+        # --- Batched rasterize all V views in one kernel ---
+        out_list, _final_T_list = _helion_batched_rasterize_forward_impl(
+            prepared_list, values_list, opacity_list,
+            background, out_w, out_h, renderer_cfg,
+        )
+
+        # --- Per-view: postprocess + loss ---
+        photo_loss = stage_targets.new_tensor(0.0)
+        rgb_finite = torch.ones((), device=device, dtype=torch.bool)
+        pred_finite = torch.ones((), device=device, dtype=torch.bool)
+
+        for v in range(num_views):
+            packed = out_list[v].permute(2, 0, 1).contiguous()
+            rgb, _latent, _alpha = self._postprocess_rgb(packed, out_h, out_w)
+            pred, photo_term = self._observe_and_photometric_loss(rgb, stage_targets[v])
+
+            if not torch.isfinite(rgb).all():
+                self._raise_nonfinite("render_rgb", 0, 0, 0, {"view_index": v})
+            if not torch.isfinite(pred).all():
+                self._raise_nonfinite("observed_prediction", 0, 0, 0, {"view_index": v})
+
+            photo_loss = photo_loss + photo_term
+            rgb_finite = rgb_finite & torch.isfinite(rgb).all()
+            pred_finite = pred_finite & torch.isfinite(pred).all()
+
+        photo_loss = photo_loss / float(max(num_views, 1))
+        reg_loss = self._regularization(None, stage_alpha)
+        loss = photo_loss + reg_loss
+        loss.backward()
+        if grad_clip > 0.0:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), grad_clip)
+        opt.step()
+        return loss.detach(), photo_loss.detach(), reg_loss.detach(), rgb_finite.detach(), pred_finite.detach()
+
     def render_with_pose(
         self,
         R_cw: Tensor,

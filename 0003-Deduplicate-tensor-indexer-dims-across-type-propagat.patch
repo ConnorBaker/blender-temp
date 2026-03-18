@@ -1,0 +1,199 @@
+From e77d577e954414d3f9b2d6b0c89f2517b0b506ac Mon Sep 17 00:00:00 2001
+From: Connor Baker <ConnorBaker01@gmail.com>
+Date: Wed, 18 Mar 2026 01:43:51 +0000
+Subject: [PATCH 3/3] Deduplicate tensor indexer dims across type propagation
+ and codegen
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When multiple tensor indices share the same block-size dimension
+(e.g. `data[view_id, gid]` where both are `[tile_tid]`-shaped), each
+independently extended `output_sizes` with that dim, producing a
+spurious 2D result `[tile_tid, tile_tid]` instead of the correct 1D
+`[tile_tid]`.
+
+In PyTorch, advanced indexing with two same-shaped 1D tensor indices
+performs element-wise (paired) indexing:
+
+    data = torch.randn(3, 4)
+    idx_a = torch.tensor([0, 1, 2])
+    idx_b = torch.tensor([1, 2, 3])
+    data[idx_a, idx_b].shape  # torch.Size([3]) — NOT [3, 3]
+
+The bug existed in three places that must agree on output shape:
+
+1. `_device_indexing_size` in type_propagation.py — determines the
+   type during type propagation for direct tensor subscripts.
+2. `SubscriptIndexing.compute_shape` in indexing_strategy.py —
+   determines the FakeTensor shape for `hl.load` results.
+3. `SubscriptIndexing.create` in indexing_strategy.py — tracks
+   `output_idx` for codegen pointer/mask expansion.
+
+Fix: in all three, skip block-size dims that are already present
+in `output_sizes`/`output_size`, so each block-size variable
+appears at most once.
+
+Tests:
+- `test_tensor_indexer_dedup_same_block_dim`: direct subscript
+  `data[r, c]` with same-dim indices produces 1D.
+- `test_2d_hl_load_in_static_range`: `hl.load(data_2d, [a, b])`
+  inside `static_range` compiles and produces correct results,
+  exercising all three dedup locations.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ helion/_compiler/indexing_strategy.py | 14 ++++-
+ helion/_compiler/type_propagation.py  |  9 ++-
+ test/test_indexing.py                 | 83 +++++++++++++++++++++++++++
+ 3 files changed, 103 insertions(+), 3 deletions(-)
+
+diff --git a/helion/_compiler/indexing_strategy.py b/helion/_compiler/indexing_strategy.py
+index f5490665..eb1367a9 100644
+--- a/helion/_compiler/indexing_strategy.py
++++ b/helion/_compiler/indexing_strategy.py
+@@ -709,7 +709,12 @@ class SubscriptIndexing(NamedTuple):
+             elif isinstance(k, torch.Tensor):
+                 input_size.popleft()
+                 if not should_broadcast:
+-                    output_size.extend(env.tensor_indexer_dims(k))
++                    # Deduplicate: same-dim tensor indices produce 1D, not
++                    # Cartesian.  Mirrors _device_indexing_size fix.
++                    new_dims = env.tensor_indexer_dims(k)
++                    for d in new_dims:
++                        if d not in output_size:
++                            output_size.append(d)
+                 elif k is tensor_indexers[0]:
+                     output_size.extend(
+                         env.tensor_indexer_broadcast_shape(tensor_indexers)
+@@ -981,7 +986,12 @@ class SubscriptIndexing(NamedTuple):
+                     ):
+                         mask_values.setdefault(f"({mask_var}){expand}")
+ 
+-                output_idx += k.ndim
++                # Advance output_idx only for dims not already present
++                # (mirrors the dedup in compute_shape).
++                new_dims = env.tensor_indexer_dims(k)
++                for d in new_dims:
++                    if d not in output_size[:output_idx]:
++                        output_idx += 1
+                 k_index += 1
+             else:
+                 raise exc.InvalidIndexingType(type(k))
+diff --git a/helion/_compiler/type_propagation.py b/helion/_compiler/type_propagation.py
+index d4830974..c3920d15 100644
+--- a/helion/_compiler/type_propagation.py
++++ b/helion/_compiler/type_propagation.py
+@@ -540,7 +540,14 @@ class TensorType(TypeInfo):
+             elif isinstance(k, TensorType):
+                 inputs_consumed += 1
+                 if not should_broadcast:
+-                    output_sizes.extend(env.tensor_indexer_dims(k.fake_value))
++                    # Deduplicate: when multiple tensor indices share the
++                    # same block-size dim (e.g. data[view_id, gid] where
++                    # both are [tile_tid]), only add the dim once.  This
++                    # matches PyTorch element-wise indexing semantics.
++                    new_dims = env.tensor_indexer_dims(k.fake_value)
++                    for d in new_dims:
++                        if d not in output_sizes:
++                            output_sizes.append(d)
+                 elif k.fake_value is tensor_indexers[0]:
+                     output_sizes.extend(
+                         env.tensor_indexer_broadcast_shape(tensor_indexers)
+diff --git a/test/test_indexing.py b/test/test_indexing.py
+index 43dd36bf..b3fa626c 100644
+--- a/test/test_indexing.py
++++ b/test/test_indexing.py
+@@ -2396,6 +2396,89 @@ class TestIndexing(RefEagerTestBase, TestCase):
+         expected = x * y
+         torch.testing.assert_close(result, expected)
+ 
++    def test_tensor_indexer_dedup_same_block_dim(self):
++        """data[idx_a, idx_b] where both indices share the same tile dim
++        should produce a 1D result, not 2D.
++
++        Previously each tensor index independently added its block-size
++        dim to output_sizes, so two [tile_tid]-shaped indices produced
++        [tile_tid, tile_tid] (2D) instead of [tile_tid] (1D).  This bug
++        existed in _device_indexing_size (type_propagation.py),
++        SubscriptIndexing.compute_shape (indexing_strategy.py), and
++        SubscriptIndexing.create (indexing_strategy.py).
++        """
++
++        @helion.kernel(config=helion.Config(block_sizes=[32]))
++        def gather_2d(
++            data: torch.Tensor,
++            row_idx: torch.Tensor,
++            col_idx: torch.Tensor,
++        ) -> torch.Tensor:
++            n = row_idx.size(0)
++            out = torch.empty([n], device=data.device, dtype=data.dtype)
++            for tile in hl.tile(n):
++                r = row_idx[tile]
++                c = col_idx[tile]
++                out[tile] = data[r, c]
++            return out
++
++        data = torch.arange(12, device=DEVICE, dtype=torch.float32).view(3, 4)
++        row_idx = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1], device=DEVICE, dtype=torch.int64)
++        col_idx = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3], device=DEVICE, dtype=torch.int64)
++        _code, result = code_and_output(gather_2d, (data, row_idx, col_idx))
++        expected = data[row_idx, col_idx]
++        torch.testing.assert_close(result, expected)
++
++    def test_2d_hl_load_in_static_range(self):
++        """hl.load(data_2d, [idx_a, idx_b]) inside static_range should work.
++
++        This exercises the full dedup fix across type propagation,
++        compute_shape, and codegen create — all three must agree that
++        two same-dim tensor indices produce a 1D result.
++        """
++
++        @helion.kernel(static_shapes=True)
++        def load_2d_accum(
++            data: torch.Tensor,
++            idx_a: torch.Tensor,
++            idx_b: torch.Tensor,
++            counts: torch.Tensor,
++            total: hl.constexpr,
++            chunk: hl.constexpr,
++        ) -> torch.Tensor:
++            chunk = hl.specialize(chunk)
++            out = torch.zeros([total], device=data.device, dtype=data.dtype)
++            for tile_t in hl.tile(total):
++                a = idx_a[tile_t]
++                b_base = idx_b[tile_t]
++                nnz = counts[tile_t]
++                max_nnz = nnz.amax()
++                acc = hl.zeros([tile_t], dtype=torch.float32)
++                for tile_k in hl.tile(0, max_nnz, block_size=chunk):
++                    for k_inner in hl.static_range(chunk):
++                        k = tile_k.begin + k_inner
++                        valid = k < nnz
++                        b = b_base + k
++                        val = hl.load(data, [a, b], extra_mask=valid)
++                        acc = acc + torch.where(valid, val, 0.0)
++                out[tile_t] = acc
++            return out
++
++        data = torch.arange(96, device=DEVICE, dtype=torch.float32).view(3, 32)
++        idx_a = torch.tensor(
++            [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2], device=DEVICE, dtype=torch.int64
++        )
++        idx_b = torch.tensor(
++            [0, 4, 8, 12, 0, 4, 8, 12, 0, 4, 8, 12], device=DEVICE, dtype=torch.int64
++        )
++        counts = torch.full((12,), 4, device=DEVICE, dtype=torch.int32)
++        _code, result = code_and_output(load_2d_accum, (data, idx_a, idx_b, counts, 12, 2))
++        expected = torch.zeros(12, device=DEVICE)
++        for t in range(12):
++            for k in range(4):
++                expected[t] += data[idx_a[t], idx_b[t] + k]
++        torch.testing.assert_close(result, expected)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.51.2
+

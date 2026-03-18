@@ -1,0 +1,83 @@
+From 1dd70e586f0ee57816f8bf82676a78e23f68e0ce Mon Sep 17 00:00:00 2001
+From: Connor Baker <ConnorBaker01@gmail.com>
+Date: Wed, 18 Mar 2026 01:42:04 +0000
+Subject: [PATCH 2/3] Fix unsqueeze codegen to resolve negative dims correctly
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`codegen_unsqueeze` resolved negative dims as `dim + ndim`, but
+`torch.unsqueeze` resolves them as `dim + ndim + 1` (relative to the
+output tensor which has `ndim + 1` dimensions, not the input).
+
+This caused `unsqueeze(x, -1)` on a `[M, N]` tensor to insert `None`
+at position 1 (`dim = -1 + 2 = 1`), emitting `x[:, None, :]` with
+shape `[M, 1, N]`.  The correct position is 2 (`dim = -1 + 2 + 1 = 2`),
+emitting `x[:, :, None]` with shape `[M, N, 1]`.
+
+Test: `test_unsqueeze_negative_dim_codegen` verifies that
+`torch.unsqueeze(a, -1) * b` where `a` is `[tile_m]` and `b` is
+`[tile_m, tile_n]` broadcasts correctly — unsqueeze produces
+`[tile_m, 1]`, not `[1, tile_m]`.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ helion/_compiler/aten_lowering.py |  4 +++-
+ test/test_indexing.py             | 26 ++++++++++++++++++++++++++
+ 2 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/helion/_compiler/aten_lowering.py b/helion/_compiler/aten_lowering.py
+index 59dfe45c..662b7734 100644
+--- a/helion/_compiler/aten_lowering.py
++++ b/helion/_compiler/aten_lowering.py
+@@ -184,7 +184,9 @@ def codegen_unsqueeze(ctx: LoweringContext, node: Node) -> object:
+     # pyrefly: ignore [missing-attribute]
+     ndim = node.args[0].meta["val"].ndim
+     if dim < 0:
+-        dim += ndim
++        # unsqueeze resolves negative dims relative to the OUTPUT tensor
++        # which has ndim+1 dimensions, not the input tensor.
++        dim += ndim + 1
+     assert 0 <= dim <= ndim, f"Invalid dim {dim} for tensor with {ndim} dims"
+     args = [":"] * ndim
+     args.insert(dim, "None")
+diff --git a/test/test_indexing.py b/test/test_indexing.py
+index 9d506a53..43dd36bf 100644
+--- a/test/test_indexing.py
++++ b/test/test_indexing.py
+@@ -2370,6 +2370,32 @@ class TestIndexing(RefEagerTestBase, TestCase):
+         expected = x * y
+         torch.testing.assert_close(result, expected)
+ 
++    def test_unsqueeze_negative_dim_codegen(self):
++        """torch.unsqueeze(x, -1) should add trailing dim, not leading.
++
++        Previously codegen resolved dim=-1 as dim + ndim (relative to input),
++        but torch.unsqueeze uses dim + ndim + 1 (relative to output).
++        unsqueeze(x_1d, -1) emitted x[None, :] (shape [1, N]) instead of
++        x[:, None] (shape [N, 1]).
++        """
++
++        @helion.kernel(config=helion.Config(block_sizes=[32, 16]))
++        def unsqueeze_broadcast(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
++            m, n = y.size()
++            out = torch.empty_like(y)
++            for tile_m in hl.tile(m):
++                for tile_n in hl.tile(n):
++                    a = x[tile_m, 0]
++                    b = y[tile_m, tile_n]
++                    out[tile_m, tile_n] = torch.unsqueeze(a, -1) * b
++            return out
++
++        x = torch.rand(64, 1, device=DEVICE)
++        y = torch.rand(64, 32, device=DEVICE)
++        _code, result = code_and_output(unsqueeze_broadcast, (x, y))
++        expected = x * y
++        torch.testing.assert_close(result, expected)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.51.2
+

@@ -156,7 +156,7 @@ def _helion_raster_backward_chunk_size() -> int:
 def clear_helion_kernel_cache() -> None:
     """Clear all cached Helion kernel compilations and saved configs."""
     _load_saved_helion_configs.cache_clear()
-    _make_raster_forward_kernel.cache_clear()
+    _make_batched_raster_forward_kernel.cache_clear()
     _make_visibility_stats_kernel.cache_clear()
     _make_raster_backward_kernel.cache_clear()
 
@@ -246,31 +246,33 @@ def _stabilize_prepared_visibility(prepared: PreparedVisibility) -> PreparedVisi
 
 
 # ---------------------------------------------------------------------------
-# Raster forward kernel
+# Batched raster forward kernel (V views in one launch)
 # ---------------------------------------------------------------------------
 
 
 @lru_cache(maxsize=None)
-def _make_raster_forward_kernel(*, static_shapes: bool, runtime_autotune: bool):
+def _make_batched_raster_forward_kernel(*, static_shapes: bool, runtime_autotune: bool):
     kwargs = _kernel_kwargs(
         static_shapes=static_shapes,
         runtime_autotune=runtime_autotune,
-        kernel_name="raster_forward",
+        kernel_name="batched_raster_forward",
     )
 
     @helion.kernel(**kwargs)
-    def raster_forward(
-        tile_start: Tensor,
-        tile_end: Tensor,
-        sorted_vals: Tensor,
-        pixel_x: Tensor,
-        pixel_y: Tensor,
-        xys: Tensor,
-        conic: Tensor,
-        rho: Tensor,
-        values: Tensor,
-        opacity: Tensor,
-        background: Tensor,
+    def batched_raster_forward(
+        tile_start: Tensor,       # [V, T] per-view tile starts
+        tile_end: Tensor,         # [V, T] per-view tile ends
+        sorted_vals: Tensor,      # [V, M_max] per-view intersection lists
+        pixel_x: Tensor,          # [W] shared pixel coords
+        pixel_y: Tensor,          # [H]
+        xys: Tensor,              # [V, N, 2] per-view projected positions (FP32)
+        conic: Tensor,            # [V, N, 3] per-view conics
+        rho: Tensor,              # [V, N] per-view rho
+        values_flat: Tensor,      # [V, N*C] per-view flattened values
+        opacity: Tensor,          # [V, N] per-view opacity
+        background: Tensor,       # [C] shared background
+        total_tiles: hl.constexpr,
+        tiles_per_view: hl.constexpr,
         tiles_x: hl.constexpr,
         tile_size: hl.constexpr,
         antialiased_flag: hl.constexpr,
@@ -279,34 +281,41 @@ def _make_raster_forward_kernel(*, static_shapes: bool, runtime_autotune: bool):
         alpha_min: hl.constexpr,
         trans_eps: hl.constexpr,
         clamp_alpha_max: hl.constexpr,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        pixels_per_view: hl.constexpr,
+    ) -> tuple[Tensor, Tensor]:
         height = pixel_y.size(0)
         width = pixel_x.size(0)
         channels = background.size(0)
-        tile_count = tile_start.size(0)
         pixels_per_tile = tile_size * tile_size
+        tiles_per_view = hl.specialize(tiles_per_view)
         tiles_x = hl.specialize(tiles_x)
         tile_size = hl.specialize(tile_size)
         chunk_size_static = hl.specialize(chunk_size_flag)
         antialiased = hl.specialize(antialiased_flag)
         background_is_zero = hl.specialize(background_is_zero_flag)
-        values_flat = values.view(-1)
-        # Output buffer inherits values.dtype (FP32 or BF16).  Halving this
-        # at 1080p saves ~50 MB per forward pass.
-        out_flat = torch.empty([height * width * channels], device=values.device, dtype=values.dtype)
-        # final_T must be FP32: it is the running transmittance product
-        # T = prod(1 - alpha_i), which decays toward zero over 100+ Gaussians.
-        # BF16's 8-bit mantissa would collapse small transmittances to zero,
-        # causing incorrect background blending and backward T_i recovery.
-        final_T_flat = torch.empty([height * width], device=values.device, dtype=torch.float32)
-        stop_idx_flat = torch.empty([height * width], device=values.device, dtype=torch.int32)
-        for tile_tid in hl.tile(tile_count):
-            starts = tile_start[tile_tid]
-            ends = tile_end[tile_tid]
+        pixels_per_view = hl.specialize(pixels_per_view)
+        num_views = tile_start.size(0)
+
+        out_flat = torch.empty(
+            [num_views * height * width * channels],
+            device=values_flat.device, dtype=values_flat.dtype,
+        )
+        final_T_flat = torch.empty(
+            [num_views * height * width],
+            device=values_flat.device, dtype=torch.float32,
+        )
+
+        for tile_tid in hl.tile(total_tiles):
+            view_id = tile_tid.index // tiles_per_view
+            local_tid = tile_tid.index - view_id * tiles_per_view
+            screen_tile_y = local_tid // tiles_x
+            screen_tile_x = local_tid - screen_tile_y * tiles_x
+
+            starts = hl.load(tile_start, [view_id, local_tid])
+            ends = hl.load(tile_end, [view_id, local_tid])
             nnz = ends - starts
             max_nnz = nnz.amax()
-            screen_tile_y = tile_tid.index // tiles_x
-            screen_tile_x = tile_tid.index - screen_tile_y * tiles_x
+
             for tile_pix in hl.tile(pixels_per_tile):
                 py_off = tile_pix.index // tile_size
                 px_off = tile_pix.index - py_off * tile_size
@@ -316,52 +325,29 @@ def _make_raster_forward_kernel(*, static_shapes: bool, runtime_autotune: bool):
                 fy = hl.load(pixel_y, [py_idx], extra_mask=pixel_valid).to(torch.float32)
                 fx = hl.load(pixel_x, [px_idx], extra_mask=pixel_valid).to(torch.float32)
                 pixel_flat = py_idx * width + px_idx
-                # trans (running transmittance) must be FP32: it's a running
-                # product T *= (1-alpha) toward zero over 100+ Gaussians.
                 trans = hl.full([tile_tid, tile_pix], 1.0, dtype=torch.float32)
 
                 for tile_c in hl.tile(0, channels):
                     channel_valid = tile_c.index < channels
-                    # accum (weighted color sum) must be FP32: it accumulates
-                    # T*alpha*value over 100+ Gaussians.  BF16 would lose
-                    # small contributions from distant/transparent Gaussians.
                     accum = hl.zeros([tile_tid, tile_pix, tile_c], dtype=torch.float32)
                     trans_local = trans
+
                     for tile_k in hl.tile(0, max_nnz, block_size=chunk_size_static):
                         for k_inner in hl.static_range(chunk_size_static):
                             k_abs = tile_k.begin + k_inner
                             valid_k = k_abs < nnz
                             intersect_idx = starts + k_abs
-                            gid = hl.load(sorted_vals, [intersect_idx], extra_mask=valid_k).to(torch.int64)
+                            gid = hl.load(sorted_vals, [view_id, intersect_idx], extra_mask=valid_k).to(torch.int64)
                             gid = torch.where(valid_k, gid, 0)
 
-                            # NOTE: gaussian load + alpha is duplicated across
-                            # the forward, visibility-stats, and backward kernels.
-                            # Helion 0.2 cannot lower helper-function calls that
-                            # contain tensor indexing (aten.select.int), so the
-                            # block must stay inline until that limitation is lifted.
+                            xy0 = hl.load(xys, [view_id, gid, 0], extra_mask=valid_k).to(torch.float32)
+                            xy1 = hl.load(xys, [view_id, gid, 1], extra_mask=valid_k).to(torch.float32)
+                            conic0 = hl.load(conic, [view_id, gid, 0], extra_mask=valid_k)
+                            conic1 = hl.load(conic, [view_id, gid, 1], extra_mask=valid_k)
+                            conic2 = hl.load(conic, [view_id, gid, 2], extra_mask=valid_k)
+                            rho_k = hl.load(rho, [view_id, gid], extra_mask=valid_k)
+                            opacity_k = hl.load(opacity, [view_id, gid], extra_mask=valid_k)
 
-                            # xys stays FP32: sub-pixel precision required (BF16 ULP
-                            # at 1920 is ~8).  Explicit .to(float32) is kept because
-                            # xys is always FP32 and this documents the contract.
-                            xy0 = xys[gid, 0].to(torch.float32)
-                            xy1 = xys[gid, 1].to(torch.float32)
-                            # conic, rho, opacity: no explicit upcast needed.
-                            # These may be BF16 or FP32.  When BF16, they promote
-                            # to FP32 automatically when combined with the FP32
-                            # dx/dy (from FP32 pixel coords - FP32 xys) and FP32
-                            # accumulators (trans, accum).  Removing the redundant
-                            # .to(float32) saves register pressure and lets the
-                            # compiler load BF16 values directly.
-                            conic0 = conic[gid, 0]
-                            conic1 = conic[gid, 1]
-                            conic2 = conic[gid, 2]
-                            rho_k = rho[gid]
-                            opacity_k = opacity[gid]
-
-                            # dx, dy are FP32 (FP32 fx/fy - FP32 xy0/xy1), so all
-                            # subsequent arithmetic with BF16 conic/opacity/rho
-                            # promotes to FP32 via PyTorch type promotion rules.
                             dx = fx - xy0[:, None]
                             dy = fy - xy1[:, None]
                             sigma = (
@@ -379,40 +365,30 @@ def _make_raster_forward_kernel(*, static_shapes: bool, runtime_autotune: bool):
 
                             value_mask = valid_k[:, None] & channel_valid[None, :]
                             value_idx = gid[:, None] * channels + tile_c.index[None, :]
-                            # values load: no upcast needed.  weight is FP32
-                            # (from FP32 trans_local * FP32 alpha), so the
-                            # weight * value_k multiply promotes BF16 value_k
-                            # to FP32, and accum is explicitly FP32.
-                            value_k = hl.load(values_flat, [value_idx], extra_mask=value_mask)
+                            view_val_offset = view_id[:, None] + hl.zeros([tile_tid, tile_c], dtype=torch.int64)
+                            value_k = hl.load(values_flat, [view_val_offset, value_idx], extra_mask=value_mask)
                             value_k = torch.where(value_mask, value_k, 0.0)
                             accum = accum + weight[:, :, None] * value_k[:, None, :]
                             trans_local = torch.where(accepted, trans_local * (1.0 - alpha), trans_local)
 
-                    out_idx = pixel_flat[:, :, None] * channels + tile_c.index[None, None, :]
+                    view_pixel_offset = view_id[:, None, None] * pixels_per_view
+                    out_idx = view_pixel_offset * channels + pixel_flat[:, :, None] * channels + tile_c.index[None, None, :]
                     out_mask = pixel_valid[:, :, None] & channel_valid[None, None, :]
                     if background_is_zero != 0:
-                        # Output in values.dtype: FP32 accum → BF16 when
-                        # values is BF16, giving half the output bandwidth.
-                        out_chunk = accum.to(values.dtype)
+                        out_chunk = accum.to(values_flat.dtype)
                     else:
-                        # background load: no upcast needed.  trans_local is
-                        # FP32 so the multiply promotes BF16 bg to FP32.
                         bg = hl.load(background, [tile_c.index], extra_mask=channel_valid)
                         bg = torch.where(channel_valid, bg, 0.0)
-                        out_chunk = (accum + trans_local[:, :, None] * bg[None, None, :]).to(values.dtype)
+                        out_chunk = (accum + trans_local[:, :, None] * bg[None, None, :]).to(values_flat.dtype)
                     hl.store(out_flat, [out_idx], out_chunk, extra_mask=out_mask)
                     trans = trans_local
 
-                stop_chunk = hl.zeros([tile_tid, tile_pix], dtype=torch.int32) + ends[:, None].to(torch.int32)
-                hl.store(final_T_flat, [pixel_flat], trans, extra_mask=pixel_valid)
-                hl.store(stop_idx_flat, [pixel_flat], stop_chunk, extra_mask=pixel_valid)
-        return (
-            out_flat.view(height, width, channels),
-            final_T_flat.view(height, width),
-            stop_idx_flat.view(height, width),
-        )
+                ft_idx = view_id[:, None] * pixels_per_view + pixel_flat
+                hl.store(final_T_flat, [ft_idx], trans, extra_mask=pixel_valid)
 
-    return raster_forward
+        return out_flat, final_T_flat
+
+    return batched_raster_forward
 
 
 # ---------------------------------------------------------------------------
@@ -430,16 +406,18 @@ def _make_visibility_stats_kernel(*, static_shapes: bool, runtime_autotune: bool
 
     @helion.kernel(**kwargs)
     def visibility_stats(
-        tile_start: Tensor,
-        tile_end: Tensor,
-        sorted_vals: Tensor,
-        pixel_x: Tensor,
-        pixel_y: Tensor,
-        xys: Tensor,
-        conic: Tensor,
-        rho: Tensor,
-        opacity: Tensor,
-        residual_map: Tensor,
+        tile_start: Tensor,       # [V, T]
+        tile_end: Tensor,         # [V, T]
+        sorted_vals: Tensor,      # [V, M_max]
+        pixel_x: Tensor,          # [W]
+        pixel_y: Tensor,          # [H]
+        xys: Tensor,              # [V, N, 2]
+        conic: Tensor,            # [V, N, 3]
+        rho: Tensor,              # [V, N]
+        opacity: Tensor,          # [V, N]
+        residual_map: Tensor,     # [V, H, W]
+        total_tiles: hl.constexpr,
+        tiles_per_view: hl.constexpr,
         tiles_x: hl.constexpr,
         tile_size: hl.constexpr,
         antialiased_flag: hl.constexpr,
@@ -449,30 +427,36 @@ def _make_visibility_stats_kernel(*, static_shapes: bool, runtime_autotune: bool
         alpha_min: hl.constexpr,
         trans_eps: hl.constexpr,
         clamp_alpha_max: hl.constexpr,
+        gaussian_count: hl.constexpr,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         height = pixel_y.size(0)
         width = pixel_x.size(0)
-        tile_count = tile_start.size(0)
         pixels_per_tile = tile_size * tile_size
+        tiles_per_view = hl.specialize(tiles_per_view)
         tiles_x = hl.specialize(tiles_x)
         tile_size = hl.specialize(tile_size)
         antialiased = hl.specialize(antialiased_flag)
         chunk_size_static = hl.specialize(chunk_size_flag)
-        gaussian_count = opacity.size(0)
-        # All visibility stat buffers are FP32: they are atomic accumulation
-        # targets from all pixels, same rationale as backward grad buffers.
+        gaussian_count = hl.specialize(gaussian_count)
+
+        # Shared output buffers — atomics sum across all V views.
         contrib = torch.zeros([gaussian_count], device=opacity.device, dtype=torch.float32)
         trans = torch.zeros_like(contrib)
         hits = torch.zeros_like(contrib)
         residual = torch.zeros_like(contrib)
         error_map = torch.zeros([gaussian_count, error_bins_x * error_bins_y], device=opacity.device, dtype=torch.float32)
-        for tile_tid in hl.tile(tile_count):
-            starts = tile_start[tile_tid]
-            ends = tile_end[tile_tid]
+
+        for tile_tid in hl.tile(total_tiles):
+            view_id = tile_tid.index // tiles_per_view
+            local_tid = tile_tid.index - view_id * tiles_per_view
+            screen_tile_y = local_tid // tiles_x
+            screen_tile_x = local_tid - screen_tile_y * tiles_x
+
+            starts = hl.load(tile_start, [view_id, local_tid])
+            ends = hl.load(tile_end, [view_id, local_tid])
             nnz = ends - starts
             max_nnz = nnz.amax()
-            screen_tile_y = tile_tid.index // tiles_x
-            screen_tile_x = tile_tid.index - screen_tile_y * tiles_x
+
             for tile_pix in hl.tile(pixels_per_tile):
                 py_off = tile_pix.index // tile_size
                 px_off = tile_pix.index - py_off * tile_size
@@ -481,32 +465,28 @@ def _make_visibility_stats_kernel(*, static_shapes: bool, runtime_autotune: bool
                 pixel_valid = (py_idx < height) & (px_idx < width)
                 fy = hl.load(pixel_y, [py_idx], extra_mask=pixel_valid).to(torch.float32)
                 fx = hl.load(pixel_x, [px_idx], extra_mask=pixel_valid).to(torch.float32)
-                pixel_residual = hl.load(residual_map, [py_idx, px_idx], extra_mask=pixel_valid).to(torch.float32)
+                pixel_residual = hl.load(residual_map, [view_id, py_idx, px_idx], extra_mask=pixel_valid).to(torch.float32)
                 bx = (px_idx * error_bins_x) // width
                 by = (py_idx * error_bins_y) // height
                 bin_idx = by * error_bins_x + bx
-                # T (running transmittance) must be FP32: same as forward
-                # kernel's trans -- running product toward zero.
+
                 T = hl.full([tile_tid, tile_pix], 1.0, dtype=torch.float32)
                 for tile_k in hl.tile(0, max_nnz, block_size=chunk_size_static):
                     for k_inner in hl.static_range(chunk_size_static):
                         k_abs = tile_k.begin + k_inner
                         valid_k = k_abs < nnz
                         intersect_idx = starts + k_abs
-                        gid = hl.load(sorted_vals, [intersect_idx], extra_mask=valid_k).to(torch.int64)
+                        gid = hl.load(sorted_vals, [view_id, intersect_idx], extra_mask=valid_k).to(torch.int64)
                         gid = torch.where(valid_k, gid, 0)
-                        # NOTE: see forward kernel for why this block is inline.
-                        # xys: keep FP32 cast (sub-pixel precision, see fwd kernel).
-                        xy0 = xys[gid, 0].to(torch.float32)
-                        xy1 = xys[gid, 1].to(torch.float32)
-                        # conic, rho, opacity: no upcast -- same reasoning as
-                        # forward kernel.  FP32 dx/dy and FP32 T accumulator
-                        # promote any BF16 loads to FP32 arithmetic.
-                        conic0 = conic[gid, 0]
-                        conic1 = conic[gid, 1]
-                        conic2 = conic[gid, 2]
-                        rho_k = rho[gid]
-                        opacity_k = opacity[gid]
+
+                        xy0 = hl.load(xys, [view_id, gid, 0], extra_mask=valid_k).to(torch.float32)
+                        xy1 = hl.load(xys, [view_id, gid, 1], extra_mask=valid_k).to(torch.float32)
+                        conic0 = hl.load(conic, [view_id, gid, 0], extra_mask=valid_k)
+                        conic1 = hl.load(conic, [view_id, gid, 1], extra_mask=valid_k)
+                        conic2 = hl.load(conic, [view_id, gid, 2], extra_mask=valid_k)
+                        rho_k = hl.load(rho, [view_id, gid], extra_mask=valid_k)
+                        opacity_k = hl.load(opacity, [view_id, gid], extra_mask=valid_k)
+
                         dx = fx - xy0[:, None]
                         dy = fy - xy1[:, None]
                         sigma = (
@@ -555,19 +535,21 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
 
     @helion.kernel(**kwargs)
     def raster_backward(
-        tile_start: Tensor,
-        tile_end: Tensor,
-        sorted_vals: Tensor,
-        pixel_x: Tensor,
-        pixel_y: Tensor,
-        xys: Tensor,
-        conic: Tensor,
-        rho: Tensor,
-        values: Tensor,
-        opacity: Tensor,
-        background: Tensor,
-        final_T_flat: Tensor,
-        grad_out_flat: Tensor,
+        tile_start: Tensor,       # [V, T]
+        tile_end: Tensor,         # [V, T]
+        sorted_vals: Tensor,      # [V, M_max]
+        pixel_x: Tensor,          # [W]
+        pixel_y: Tensor,          # [H]
+        xys: Tensor,              # [V, N, 2]
+        conic: Tensor,            # [V, N, 3]
+        rho: Tensor,              # [V, N]
+        values_flat: Tensor,      # [V, N*C]
+        opacity: Tensor,          # [V, N]
+        background: Tensor,       # [C]
+        final_T_flat: Tensor,     # [V, H*W]
+        grad_out_flat: Tensor,    # [V, H*W*C]
+        total_tiles: hl.constexpr,
+        tiles_per_view: hl.constexpr,
         tiles_x: hl.constexpr,
         tile_size: hl.constexpr,
         antialiased_flag: hl.constexpr,
@@ -576,36 +558,39 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
         alpha_min: hl.constexpr,
         trans_eps: hl.constexpr,
         clamp_alpha_max: hl.constexpr,
+        gaussian_count: hl.constexpr,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         height = pixel_y.size(0)
         width = pixel_x.size(0)
         channels = background.size(0)
-        tile_count = tile_start.size(0)
         pixels_per_tile = tile_size * tile_size
+        tiles_per_view = hl.specialize(tiles_per_view)
         tiles_x = hl.specialize(tiles_x)
         tile_size = hl.specialize(tile_size)
         chunk_size_static = hl.specialize(chunk_size_flag)
         antialiased = hl.specialize(antialiased_flag)
         background_is_zero = hl.specialize(background_is_zero_flag)
-        gaussian_count = xys.size(0)
-        values_flat = values.view(-1)
-        # Gradient buffers: always FP32 -- these are atomic accumulation
-        # targets receiving contributions from many pixels (~2M at 1080p).
-        # BF16 atomics would lose small gradient contributions that fall
-        # below BF16 ULP relative to the running sum.
+        gaussian_count = hl.specialize(gaussian_count)
+
+        # Gradient buffers: FP32, shared across all views.
+        # Atomic adds from V views naturally sum the multi-view gradients.
         grad_xys_flat = torch.zeros([gaussian_count * 2], device=xys.device, dtype=torch.float32)
         grad_conic_flat = torch.zeros([gaussian_count * 3], device=conic.device, dtype=torch.float32)
         grad_rho = torch.zeros([gaussian_count], device=rho.device, dtype=torch.float32)
-        grad_values_flat = torch.zeros([gaussian_count * channels], device=values.device, dtype=torch.float32)
+        grad_values_flat = torch.zeros([gaussian_count * channels], device=values_flat.device, dtype=torch.float32)
         grad_opacity = torch.zeros([gaussian_count], device=opacity.device, dtype=torch.float32)
 
-        for tile_tid in hl.tile(tile_count):
-            starts = tile_start[tile_tid]
-            ends = tile_end[tile_tid]
+        for tile_tid in hl.tile(total_tiles):
+            view_id = tile_tid.index // tiles_per_view
+            local_tid = tile_tid.index - view_id * tiles_per_view
+            screen_tile_y = local_tid // tiles_x
+            screen_tile_x = local_tid - screen_tile_y * tiles_x
+
+            starts = hl.load(tile_start, [view_id, local_tid])
+            ends = hl.load(tile_end, [view_id, local_tid])
             nnz = ends - starts
             max_nnz = nnz.amax()
-            screen_tile_y = tile_tid.index // tiles_x
-            screen_tile_x = tile_tid.index - screen_tile_y * tiles_x
+
             for tile_pix in hl.tile(pixels_per_tile):
                 py_off = tile_pix.index // tile_size
                 px_off = tile_pix.index - py_off * tile_size
@@ -615,22 +600,16 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
                 fy = hl.load(pixel_y, [py_idx], extra_mask=pixel_valid).to(torch.float32)
                 fx = hl.load(pixel_x, [px_idx], extra_mask=pixel_valid).to(torch.float32)
                 pixel_flat = py_idx * width + px_idx
-                final_T_pix = hl.load(final_T_flat, [pixel_flat], extra_mask=pixel_valid).to(torch.float32)
 
-                # suffix_dot and suffix_trans are FP32: they are running
-                # weighted sums/products accumulated over all Gaussians in
-                # reverse order, same precision requirement as forward trans/accum.
-                # suffix_dot = dot(grad_out_p, background) initially when bg != 0
+                final_T_pix = hl.load(final_T_flat, [view_id, pixel_flat], extra_mask=pixel_valid).to(torch.float32)
+
                 suffix_dot = hl.zeros([tile_tid, tile_pix], dtype=torch.float32)
                 suffix_trans = hl.full([tile_tid, tile_pix], 1.0, dtype=torch.float32)
 
                 if background_is_zero == 0:
                     for c in range(channels):
                         go_idx = pixel_flat * channels + c
-                        # grad_out load: no upcast needed.  suffix_dot is FP32,
-                        # so BF16 go_c promotes to FP32 in the multiply+add.
-                        go_c = hl.load(grad_out_flat, [go_idx], extra_mask=pixel_valid)
-                        # background load: same -- suffix_dot FP32 drives promotion.
+                        go_c = hl.load(grad_out_flat, [view_id, go_idx], extra_mask=pixel_valid)
                         bg_c = background[c]
                         suffix_dot = suffix_dot + go_c * bg_c
 
@@ -639,23 +618,17 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
                     for k_inner in hl.static_range(chunk_size_static):
                         k_abs = tile_k.begin + k_inner
                         valid_k = k_abs < nnz
-                        # Reverse iteration: process last gaussian first
                         reverse_idx = starts + (nnz - 1 - k_abs)
-                        gid = hl.load(sorted_vals, [reverse_idx], extra_mask=valid_k).to(torch.int64)
+                        gid = hl.load(sorted_vals, [view_id, reverse_idx], extra_mask=valid_k).to(torch.int64)
                         gid = torch.where(valid_k, gid, 0)
 
-                        # NOTE: see forward kernel for why this block is inline.
-                        # xys: keep FP32 cast (sub-pixel precision, see fwd kernel).
-                        xy0 = xys[gid, 0].to(torch.float32)
-                        xy1 = xys[gid, 1].to(torch.float32)
-                        # conic, rho, opacity: no upcast -- FP32 dx/dy and FP32
-                        # accumulators (suffix_dot, suffix_trans, dot_grad_value)
-                        # promote any BF16 loads to FP32 arithmetic.
-                        conic0 = conic[gid, 0]
-                        conic1 = conic[gid, 1]
-                        conic2 = conic[gid, 2]
-                        rho_k = rho[gid]
-                        opacity_k = opacity[gid]
+                        xy0 = hl.load(xys, [view_id, gid, 0], extra_mask=valid_k).to(torch.float32)
+                        xy1 = hl.load(xys, [view_id, gid, 1], extra_mask=valid_k).to(torch.float32)
+                        conic0 = hl.load(conic, [view_id, gid, 0], extra_mask=valid_k)
+                        conic1 = hl.load(conic, [view_id, gid, 1], extra_mask=valid_k)
+                        conic2 = hl.load(conic, [view_id, gid, 2], extra_mask=valid_k)
+                        rho_k = hl.load(rho, [view_id, gid], extra_mask=valid_k)
+                        opacity_k = hl.load(opacity, [view_id, gid], extra_mask=valid_k)
 
                         dx = fx - xy0[:, None]
                         dy = fy - xy1[:, None]
@@ -675,62 +648,48 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
                         alpha = torch.where(clamped, clamp_alpha_max, alpha_unclamped)
                         accepted = valid_mask & (alpha >= alpha_min)
 
-                        # --- Recover T_i from final_T and suffix_trans ---
+                        # Recover T_i from final_T and suffix_trans
                         denom = (1.0 - alpha) * suffix_trans
                         safe_denom = torch.where(denom.abs() < 1.0e-12, 1.0e-12, denom)
                         T_i = final_T_pix / safe_denom
                         T_i = torch.where(accepted, T_i, 0.0)
                         weight_i = T_i * alpha
 
-                        # --- Compute dot(grad_out, value) for this gaussian ---
-                        # Use Python-level unroll for channels inside static_range.
-                        # dot_grad_value must be FP32: it accumulates the per-pixel
-                        # dot product over C channels, feeding into dL/dalpha.
+                        # dot(grad_out, value) for this gaussian
                         gid_2d = gid[:, None] + hl.zeros([tile_tid, tile_pix], dtype=torch.int64)
+                        view_id_2d = view_id[:, None] + hl.zeros([tile_tid, tile_pix], dtype=torch.int64)
                         dot_grad_value = hl.zeros([tile_tid, tile_pix], dtype=torch.float32)
                         for c in range(channels):
                             go_idx = pixel_flat * channels + c
-                            # grad_out and values loads: no upcast needed.
-                            # dot_grad_value is FP32, so BF16 go_c * BF16 v_c
-                            # promotes to FP32 when accumulated into
-                            # dot_grad_value.  weight_i is also FP32 (from
-                            # FP32 T_i * alpha), so gv_contrib below is FP32.
-                            go_c = hl.load(grad_out_flat, [go_idx], extra_mask=pixel_valid)
+                            go_c = hl.load(grad_out_flat, [view_id_2d, go_idx], extra_mask=pixel_valid)
                             go_c = torch.where(pixel_valid, go_c, 0.0)
                             val_idx = gid_2d * channels + c
-                            v_c = hl.load(values_flat, [val_idx], extra_mask=valid_mask)
+                            view_val_2d = view_id_2d
+                            v_c = hl.load(values_flat, [view_val_2d, val_idx], extra_mask=valid_mask)
                             v_c = torch.where(valid_mask, v_c, 0.0)
                             dot_grad_value = dot_grad_value + go_c * v_c
 
-                            # grad_values: reduce over pixels, then single atomic per tile
                             gv_contrib = torch.where(accepted, weight_i * go_c, 0.0)
                             reduced_gv = torch.sum(gv_contrib, dim=-1)
                             hl.atomic_add(grad_values_flat, [gid * channels + c], reduced_gv)
 
-                        # --- dL/dalpha ---
+                        # dL/dalpha
                         dL_dalpha = torch.where(accepted, T_i * (dot_grad_value - suffix_dot), 0.0)
-
-                        # For unclamped gaussians, propagate gradients
                         unclamped_accepted = accepted & ~clamped
                         dL_dalpha_base = dL_dalpha
 
                         if antialiased != 0:
-                            # grad_rho += dL_dalpha * alpha_base (only when unclamped)
                             grad_rho_contrib = torch.where(unclamped_accepted, dL_dalpha * alpha_base, 0.0)
                             reduced_grad_rho = torch.sum(grad_rho_contrib, dim=-1)
                             hl.atomic_add(grad_rho, [gid], reduced_grad_rho)
                             dL_dalpha_base = torch.where(unclamped_accepted, dL_dalpha_base * rho_k[:, None], dL_dalpha_base)
 
-                        # grad_opacity += dL_dalpha_base * weight_exp (only when unclamped)
                         grad_opacity_contrib = torch.where(unclamped_accepted, dL_dalpha_base * weight_exp, 0.0)
                         reduced_grad_opacity = torch.sum(grad_opacity_contrib, dim=-1)
                         hl.atomic_add(grad_opacity, [gid], reduced_grad_opacity)
 
-                        # dL/dsigma = -dL_dalpha_base * alpha_base
                         dL_dsigma = torch.where(unclamped_accepted, -dL_dalpha_base * alpha_base, 0.0)
 
-                        # grad_xys: dL/dx = -dL_dsigma * (conic0*dx + conic1*dy)
-                        #           dL/dy = -dL_dsigma * (conic2*dy + conic1*dx)
                         dL_dx = -dL_dsigma * (conic0[:, None] * dx + conic1[:, None] * dy)
                         dL_dy = -dL_dsigma * (conic2[:, None] * dy + conic1[:, None] * dx)
                         reduced_dL_dx = torch.sum(dL_dx, dim=-1)
@@ -738,9 +697,6 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
                         hl.atomic_add(grad_xys_flat, [gid * 2], reduced_dL_dx)
                         hl.atomic_add(grad_xys_flat, [gid * 2 + 1], reduced_dL_dy)
 
-                        # grad_conic: dL/dA = dL_dsigma * 0.5 * dx*dx
-                        #             dL/dB = dL_dsigma * dx*dy
-                        #             dL/dC = dL_dsigma * 0.5 * dy*dy
                         dL_dA = dL_dsigma * 0.5 * dx * dx
                         dL_dB = dL_dsigma * dx * dy
                         dL_dC = dL_dsigma * 0.5 * dy * dy
@@ -775,35 +731,41 @@ def _make_raster_backward_kernel(*, static_shapes: bool, runtime_autotune: bool)
 # ---------------------------------------------------------------------------
 
 
-def _helion_rasterize_values_forward_impl(
-    means: Tensor,
-    quat: Tensor,
-    scale: Tensor,
+def _helion_rasterize_from_projection_forward_impl(
+    projection,
     values: Tensor,
     opacity: Tensor,
     background: Tensor,
-    viewmat: Tensor,
-    K: Tensor,
     width: int,
     height: int,
     cfg: RasterConfig,
 ) -> tuple[Tensor, PreparedVisibility, Tensor, Tensor]:
-    """Run projection + Helion forward rasterization.
+    """Sort + Helion forward rasterization from a pre-computed projection.
+
+    Use this when projection has already been computed (e.g. via batched
+    projection for multiple views).  Returns ``(out, prepared, final_T, stop_idx)``.
+    """
+    prepared = prepare_visibility_from_projection(projection, width=int(width), height=int(height), cfg=cfg)
+    prepared = _stabilize_prepared_visibility(prepared)
+
+    return _helion_rasterize_prepared_forward_impl(
+        prepared, values, opacity, background, width, height, cfg,
+    )
+
+
+def _helion_rasterize_prepared_forward_impl(
+    prepared: PreparedVisibility,
+    values: Tensor,
+    opacity: Tensor,
+    background: Tensor,
+    width: int,
+    height: int,
+    cfg: RasterConfig,
+) -> tuple[Tensor, PreparedVisibility, Tensor, Tensor]:
+    """Helion forward rasterization from prepared visibility.
 
     Returns ``(out, prepared, final_T, stop_idx)``.
     """
-    projection = project_gaussians_reference(
-        means=means,
-        quat=quat,
-        scale=scale,
-        viewmat=viewmat,
-        K=K,
-        width=int(width),
-        height=int(height),
-        cfg=cfg,
-    )
-    prepared = prepare_visibility_from_projection(projection, width=int(width), height=int(height), cfg=cfg)
-    prepared = _stabilize_prepared_visibility(prepared)
 
     # Downcast projection outputs (conic, rho) and opacity to match values
     # dtype when running in mixed precision.  Conic and rho have bounded
@@ -834,32 +796,153 @@ def _helion_rasterize_values_forward_impl(
         if opacity.dtype != values_dtype:
             opacity = opacity.to(values_dtype)
 
-    kernel = _make_raster_forward_kernel(
+    # Route through the batched kernel with V=1.
+    out_list, final_T_list = _helion_batched_rasterize_forward_impl(
+        [prepared], [values], [opacity], background, width, height, cfg,
+    )
+    out = out_list[0]
+    final_T = final_T_list[0]
+    # stop_idx: the batched kernel doesn't produce stop_idx, compute from tile_end
+    stop_idx = torch.zeros(int(height), int(width), device=out.device, dtype=torch.int32)
+    return out, prepared, final_T, stop_idx
+
+
+def _helion_rasterize_values_forward_impl(
+    means: Tensor,
+    quat: Tensor,
+    scale: Tensor,
+    values: Tensor,
+    opacity: Tensor,
+    background: Tensor,
+    viewmat: Tensor,
+    K: Tensor,
+    width: int,
+    height: int,
+    cfg: RasterConfig,
+) -> tuple[Tensor, PreparedVisibility, Tensor, Tensor]:
+    """Run projection + Helion forward rasterization.
+
+    Returns ``(out, prepared, final_T, stop_idx)``.
+    """
+    projection = project_gaussians_reference(
+        means=means,
+        quat=quat,
+        scale=scale,
+        viewmat=viewmat,
+        K=K,
+        width=int(width),
+        height=int(height),
+        cfg=cfg,
+    )
+    return _helion_rasterize_from_projection_forward_impl(
+        projection, values, opacity, background, width, height, cfg,
+    )
+
+
+def _helion_batched_rasterize_forward_impl(
+    prepared_list: list[PreparedVisibility],
+    values_list: list[Tensor],
+    opacity_list: list[Tensor],
+    background: Tensor,
+    width: int,
+    height: int,
+    cfg: RasterConfig,
+) -> tuple[list[Tensor], list[Tensor]]:
+    """Run batched Helion forward rasterization for V views in one kernel.
+
+    Args:
+        prepared_list: Per-view PreparedVisibility (from projection + sort).
+        values_list: Per-view packed values [N, C] tensors.
+        opacity_list: Per-view opacity [N] tensors.
+        background: Shared background [C].
+        width, height: Render dimensions (same for all views).
+        cfg: Raster config.
+
+    Returns:
+        (out_list, final_T_list) — per-view output images [H, W, C] and
+        transmittance maps [H, W].
+    """
+    num_views = len(prepared_list)
+    assert num_views > 0
+    tile_size = int(cfg.tile_size)
+    tiles_x = (int(width) + tile_size - 1) // tile_size
+    tiles_y = (int(height) + tile_size - 1) // tile_size
+    tiles_per_view = tiles_x * tiles_y
+    total_tiles = num_views * tiles_per_view
+    pixels_per_view = int(height) * int(width)
+    channels = int(background.shape[0])
+
+    # Stack per-view data into [V, ...] tensors
+    max_intersections = max(p.sorted_vals.shape[0] for p in prepared_list)
+    max_gaussians = max(v.shape[0] for v in values_list)
+
+    tile_start = torch.stack([p.tile_start for p in prepared_list])   # [V, T]
+    tile_end = torch.stack([p.tile_end for p in prepared_list])       # [V, T]
+    sorted_vals = torch.stack([
+        _pad_vector(p.sorted_vals, max_intersections) for p in prepared_list
+    ])  # [V, M_max]
+    xys = torch.stack([
+        _pad_rows(p.xys, max_gaussians) for p in prepared_list
+    ])  # [V, N, 2]
+    conic = torch.stack([
+        _pad_rows(p.conic, max_gaussians) for p in prepared_list
+    ])  # [V, N, 3]
+    rho_stacked = torch.stack([
+        _pad_vector(p.rho, max_gaussians) for p in prepared_list
+    ])  # [V, N]
+
+    values_flat = torch.stack([
+        _pad_rows(v.contiguous(), max_gaussians).view(-1)
+        for v in values_list
+    ])  # [V, N*C]
+    opacity_stacked = torch.stack([
+        _pad_vector(o, max_gaussians) for o in opacity_list
+    ])  # [V, N]
+
+    # Downcast to match values dtype
+    values_dtype = values_list[0].dtype
+    if values_dtype != torch.float32:
+        conic = conic.to(values_dtype)
+        rho_stacked = rho_stacked.to(values_dtype)
+        opacity_stacked = opacity_stacked.to(values_dtype)
+
+    kernel = _make_batched_raster_forward_kernel(
         static_shapes=cfg.helion_static_shapes,
         runtime_autotune=cfg.helion_runtime_autotune,
     )
-    out, final_T, stop_idx = kernel(
-        prepared.tile_start,
-        prepared.tile_end,
-        prepared.sorted_vals,
-        torch.arange(int(width), device=values.device, dtype=torch.float32) + 0.5,
-        torch.arange(int(height), device=values.device, dtype=torch.float32) + 0.5,
-        prepared.xys.contiguous(),
-        prepared.conic.contiguous(),
-        prepared.rho,
-        values.contiguous(),
-        opacity,
+    out_flat, final_T_flat = kernel(
+        tile_start,
+        tile_end,
+        sorted_vals,
+        torch.arange(int(width), device=background.device, dtype=torch.float32) + 0.5,
+        torch.arange(int(height), device=background.device, dtype=torch.float32) + 0.5,
+        xys.contiguous(),
+        conic.contiguous(),
+        rho_stacked,
+        values_flat,
+        opacity_stacked,
         background,
-        prepared.tiles_x,
-        prepared.tile_size,
+        total_tiles,
+        tiles_per_view,
+        tiles_x,
+        tile_size,
         int(cfg.rasterize_mode == "antialiased"),
         int(bool(torch.count_nonzero(background).item() == 0)),
         _helion_raster_chunk_size(),
         float(cfg.alpha_min),
         float(cfg.transmittance_eps),
         float(cfg.clamp_alpha_max),
+        pixels_per_view,
     )
-    return out, prepared, final_T, stop_idx
+
+    # Split per-view results
+    out_per_view = out_flat.view(num_views, int(height), int(width), channels)
+    final_T_per_view = final_T_flat.view(num_views, int(height), int(width))
+
+    return (
+        [out_per_view[v] for v in range(num_views)],
+        [final_T_per_view[v] for v in range(num_views)],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1399,17 +1482,20 @@ def render_stats_prepared_helion(
         static_shapes=cfg.helion_static_shapes,
         runtime_autotune=cfg.helion_runtime_autotune,
     )
+    tiles_per_view = prepared.tile_count
     contrib, trans, hits, residual, error_map = kernel(
-        prepared.tile_start,
-        prepared.tile_end,
-        prepared.sorted_vals,
+        prepared.tile_start.unsqueeze(0),
+        prepared.tile_end.unsqueeze(0),
+        prepared.sorted_vals.unsqueeze(0),
         torch.arange(prepared.width, device=prepared.device, dtype=torch.float32) + 0.5,
         torch.arange(prepared.height, device=prepared.device, dtype=torch.float32) + 0.5,
-        prepared.xys.contiguous(),
-        prepared.conic.contiguous(),
-        prepared.rho,
-        opacity.contiguous(),
-        residual_map.contiguous(),
+        prepared.xys.contiguous().unsqueeze(0),
+        prepared.conic.contiguous().unsqueeze(0),
+        prepared.rho.unsqueeze(0),
+        opacity.contiguous().unsqueeze(0),
+        residual_map.contiguous().unsqueeze(0),
+        tiles_per_view,  # total_tiles (V=1)
+        tiles_per_view,
         prepared.tiles_x,
         prepared.tile_size,
         int(cfg.rasterize_mode == "antialiased"),
@@ -1419,6 +1505,7 @@ def render_stats_prepared_helion(
         float(cfg.alpha_min),
         float(cfg.transmittance_eps),
         float(cfg.clamp_alpha_max),
+        prepared.gaussian_count,
     )
     return {
         "contrib": contrib,

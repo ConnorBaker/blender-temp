@@ -51,6 +51,12 @@ final: prev: {
         dependencies = prevAttrs.dependencies ++ [
           finalPythonPackages.scikit-learn
         ];
+
+        patches = prevAttrs.patches or [] ++ [
+          ./0001-Fix-None-indexing-to-append-implicit-trailing-slices.patch
+          ./0002-Fix-unsqueeze-codegen-to-resolve-negative-dims-corre.patch
+          ./0003-Deduplicate-tensor-indexer-dims-across-type-propagat.patch
+        ];
       });
 
       torch = prevPythonPackages.torch.overrideAttrs (prevAttrs: {

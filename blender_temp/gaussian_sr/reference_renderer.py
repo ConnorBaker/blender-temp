@@ -163,9 +163,6 @@ def project_gaussians_reference(
 
     tiles_x = (int(width) + int(cfg.tile_size) - 1) // int(cfg.tile_size)
     tiles_y = (int(height) + int(cfg.tile_size) - 1) // int(cfg.tile_size)
-    tile_min = torch.zeros((means.shape[0], 2), device=device, dtype=torch.int32)
-    tile_max = torch.full((means.shape[0], 2), -1, device=device, dtype=torch.int32)
-    num_tiles_hit = torch.zeros((means.shape[0],), device=device, dtype=torch.int32)
 
     valid = depth_valid
     if float(cfg.radius_clip) > 0.0:
@@ -174,31 +171,29 @@ def project_gaussians_reference(
         (u + radius_f < 0.0) | (u - radius_f >= float(width)) | (v + radius_f < 0.0) | (v - radius_f >= float(height))
     )
 
-    if bool(valid.any().item()):
-        tile_min_f = torch.stack(
-            (
-                torch.floor((u - radius_f) / float(cfg.tile_size)),
-                torch.floor((v - radius_f) / float(cfg.tile_size)),
-            ),
-            dim=-1,
-        )
-        tile_max_f = torch.stack(
-            (
-                torch.floor((u + radius_f) / float(cfg.tile_size)),
-                torch.floor((v + radius_f) / float(cfg.tile_size)),
-            ),
-            dim=-1,
-        )
-        tile_min_valid = tile_min_f[valid].to(torch.int32)
-        tile_max_valid = tile_max_f[valid].to(torch.int32)
-        tile_min_valid[:, 0].clamp_(0, tiles_x - 1)
-        tile_min_valid[:, 1].clamp_(0, tiles_y - 1)
-        tile_max_valid[:, 0].clamp_(0, tiles_x - 1)
-        tile_max_valid[:, 1].clamp_(0, tiles_y - 1)
-        tile_min[valid] = tile_min_valid
-        tile_max[valid] = tile_max_valid
-        hit = (tile_max_valid[:, 0] - tile_min_valid[:, 0] + 1) * (tile_max_valid[:, 1] - tile_min_valid[:, 1] + 1)
-        num_tiles_hit[valid] = hit.to(torch.int32)
+    # Compute tile bounds unconditionally (no data-dependent branch) so that
+    # this function is compatible with torch.vmap.  Invalid Gaussians are
+    # masked to (0,0)/(−1,−1) which yields num_tiles_hit == 0.
+    tile_min_x = torch.floor((u - radius_f) / float(cfg.tile_size)).to(torch.int32).clamp(0, tiles_x - 1)
+    tile_min_y = torch.floor((v - radius_f) / float(cfg.tile_size)).to(torch.int32).clamp(0, tiles_y - 1)
+    tile_max_x = torch.floor((u + radius_f) / float(cfg.tile_size)).to(torch.int32).clamp(0, tiles_x - 1)
+    tile_max_y = torch.floor((v + radius_f) / float(cfg.tile_size)).to(torch.int32).clamp(0, tiles_y - 1)
+
+    zero_i32 = torch.zeros_like(radius)
+    neg1_i32 = torch.full_like(radius, -1)
+    tile_min = torch.stack(
+        (torch.where(valid, tile_min_x, zero_i32), torch.where(valid, tile_min_y, zero_i32)),
+        dim=-1,
+    )
+    tile_max = torch.stack(
+        (torch.where(valid, tile_max_x, neg1_i32), torch.where(valid, tile_max_y, neg1_i32)),
+        dim=-1,
+    )
+    num_tiles_hit = torch.where(
+        valid,
+        ((tile_max_x - tile_min_x + 1) * (tile_max_y - tile_min_y + 1)).to(torch.int32),
+        zero_i32,
+    )
 
     return ReferenceProjection(
         xys=xys,
@@ -338,9 +333,60 @@ def render_values_from_prepared_reference(
     return out
 
 
+def project_gaussians_batched(
+    means: Tensor,
+    quat: Tensor,
+    scale: Tensor,
+    viewmats: Tensor,
+    Ks: Tensor,
+    width: int,
+    height: int,
+    cfg: RasterConfig | None = None,
+) -> ReferenceProjection:
+    """Project N Gaussians through V views using torch.vmap.
+
+    Args:
+        means: Gaussian centers [N, 3]
+        quat: Gaussian quaternions [N, 4]
+        scale: Gaussian scales [N, 3]
+        viewmats: Per-view 4x4 viewmats [V, 4, 4]
+        Ks: Per-view 3x3 intrinsics [V, 3, 3]
+        width: Render width
+        height: Render height
+        cfg: Raster config (uses defaults if None)
+
+    Returns:
+        ReferenceProjection with all fields having shape [V, N, ...].
+        project_gaussians_reference is vmap-compatible (no .item() calls
+        or data-dependent control flow), so this is a thin vmap wrapper.
+    """
+    if cfg is None:
+        cfg = RasterConfig()
+
+    def _project_one_view(viewmat: Tensor, K: Tensor) -> tuple[Tensor, ...]:
+        proj = project_gaussians_reference(
+            means=means, quat=quat, scale=scale,
+            viewmat=viewmat, K=K,
+            width=width, height=height, cfg=cfg,
+        )
+        return (proj.xys, proj.conic, proj.rho, proj.radius,
+                proj.tile_min, proj.tile_max, proj.num_tiles_hit, proj.depth_key)
+
+    xys, conic, rho, radius, tile_min, tile_max, num_tiles_hit, depth_key = torch.vmap(
+        _project_one_view, in_dims=(0, 0),
+    )(viewmats, Ks)
+
+    return ReferenceProjection(
+        xys=xys, conic=conic, rho=rho, radius=radius,
+        tile_min=tile_min, tile_max=tile_max,
+        num_tiles_hit=num_tiles_hit, depth_key=depth_key,
+    )
+
+
 __all__ = [
     "ReferenceProjection",
     "project_gaussians_reference",
+    "project_gaussians_batched",
     "render_values_from_prepared_reference",
     "render_values_reference",
 ]

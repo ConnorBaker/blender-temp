@@ -1,0 +1,94 @@
+From bb93eb57a9a4bbbf6bca32f84dc47e16c2a9f38d Mon Sep 17 00:00:00 2001
+From: Connor Baker <ConnorBaker01@gmail.com>
+Date: Wed, 18 Mar 2026 01:41:34 +0000
+Subject: [PATCH 1/3] Fix None indexing to append implicit trailing slices
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`_device_indexing_size` required that the number of consumed index
+dimensions exactly equals the tensor's ndim.  But `None` indices add
+output dimensions without consuming input dimensions, so
+`tensor[:, None]` on a 2D tensor consumed only 1 dimension (from `:`)
+while requiring 2 — raising `RankMismatch`.
+
+In PyTorch, `x[:, None]` on a shape `[M, N]` tensor is equivalent to
+`x[:, None, :]`, producing shape `[M, 1, N]`.  The trailing `:`
+dimension is implicit.
+
+Fix: change the check from `inputs_consumed != ndim` to
+`inputs_consumed > ndim`, and append the remaining input dimensions
+as implicit trailing slices.
+
+Test: `test_none_indexing_implicit_trailing_slice` verifies that
+`x[tile_m, 0][:, None] * y[tile_m, tile_n]` compiles and produces
+correct output, exercising the 1D→2D cross-tile None broadcast that
+previously raised RankMismatch.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ helion/_compiler/type_propagation.py |  7 ++++++-
+ test/test_indexing.py                | 25 +++++++++++++++++++++++++
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/helion/_compiler/type_propagation.py b/helion/_compiler/type_propagation.py
+index ab556393..d4830974 100644
+--- a/helion/_compiler/type_propagation.py
++++ b/helion/_compiler/type_propagation.py
+@@ -549,12 +549,17 @@ class TensorType(TypeInfo):
+                 raise exc.OverpackedTile(k)
+             else:
+                 raise exc.InvalidIndexingType(k)
+-        if inputs_consumed != self.fake_value.ndim:
++        if inputs_consumed > self.fake_value.ndim:
+             raise exc.RankMismatch(
+                 self.fake_value.ndim,
+                 inputs_consumed,
+                 f"tensor shape: {tuple(self.fake_value.shape)}",
+             )
++        # Append remaining dimensions as implicit trailing slices,
++        # matching PyTorch semantics where tensor[:, None] on a 2D
++        # tensor is equivalent to tensor[:, None, :].
++        for dim in range(inputs_consumed, self.fake_value.ndim):
++            output_sizes.append(self.fake_value.size(dim))
+         return output_sizes
+ 
+     def propagate_setitem(
+diff --git a/test/test_indexing.py b/test/test_indexing.py
+index e9a57cf6..9d506a53 100644
+--- a/test/test_indexing.py
++++ b/test/test_indexing.py
+@@ -2346,5 +2346,30 @@ class TestIndexing(RefEagerTestBase, TestCase):
+         self.assertExpectedJournal(code)
+ 
+ 
++    def test_none_indexing_implicit_trailing_slice(self):
++        """tensor[:, None] on a 2D tensor should work like tensor[:, None, :].
++
++        Previously raised RankMismatch because None indices don't consume
++        input dimensions, but the validator required all dims consumed.
++        """
++
++        @helion.kernel(config=helion.Config(block_sizes=[32, 16]))
++        def none_index_broadcast(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
++            m, n = x.size()
++            out = torch.empty_like(x)
++            for tile_m in hl.tile(m):
++                for tile_n in hl.tile(n):
++                    a = x[tile_m, 0]
++                    b = y[tile_m, tile_n]
++                    out[tile_m, tile_n] = a[:, None] * b
++            return out
++
++        x = torch.rand(64, 1, device=DEVICE)
++        y = torch.rand(64, 32, device=DEVICE)
++        _code, result = code_and_output(none_index_broadcast, (x, y))
++        expected = x * y
++        torch.testing.assert_close(result, expected)
++
++
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.51.2
+
