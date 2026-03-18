@@ -29,7 +29,7 @@ from blender_temp.gaussian_sr import (
     apply_density_control,
     should_run_density_control_for_stage,
 )
-from blender_temp.gaussian_sr.density_control import DensityViewCoverage, DensityViewObservation
+from blender_temp.gaussian_sr.density import DensityViewCoverage, DensityViewObservation
 from blender_temp.gaussian_sr.debug_checkpoint import restore_module_from_debug_checkpoint
 from blender_temp.gaussian_sr.pipeline import _META_STAT_KEYS
 from blender_temp.gaussian_sr.observation_model import observation_render_size

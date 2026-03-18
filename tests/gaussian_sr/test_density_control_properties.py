@@ -2,18 +2,18 @@ import torch
 from hypothesis import given, strategies as st
 from torch.testing import assert_close
 
-from blender_temp.gaussian_sr.density_control import (
-    _reseed_view_indices,
+from blender_temp.gaussian_sr.density import (
+    DensityViewCoverage,
+    NormalizedRenderStats,
     apply_density_control,
     build_density_debug_summary,
     compute_prune_keep_mask,
-    DensityViewCoverage,
-    NormalizedRenderStats,
     normalize_render_stats,
     select_clone_indices,
     should_run_density_control,
     should_run_density_control_for_stage,
 )
+from blender_temp.gaussian_sr.density.coverage import _reseed_view_indices
 from blender_temp.gaussian_sr.field import CanonicalGaussianField
 from blender_temp.gaussian_sr.posefree_config import AppearanceConfig, DensityControlConfig, FieldConfig
 

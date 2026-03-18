@@ -4,16 +4,19 @@ import helion.language as hl  # type: ignore[import-untyped]
 from .appearance import apply_view_dependent_rgb, num_sh_bases, sh_basis
 from .benchmarking import aggregate_step_metrics, compare_render_summary, select_compare_views, summarize_render_output
 from .camera import LearnableCameraBundle, LearnableSharedIntrinsics
-from .density_control import (
-    apply_density_control,
-    build_density_debug_summary,
-    compute_prune_keep_mask,
+from .density import (
     DensityControlResult,
     DensityDebugEntry,
     DensityDebugSummary,
+    DensityEventCallback,
     DensityScoreTerms,
-    gradient_score,
     NormalizedRenderStats,
+    append_density_event_jsonl,
+    apply_density_control,
+    build_density_debug_summary,
+    compute_prune_keep_mask,
+    emit_density_event,
+    gradient_score,
     normalize_render_stats,
     scale_score,
     select_clone_indices,
@@ -21,7 +24,6 @@ from .density_control import (
     should_run_density_control,
     should_run_density_control_for_stage,
 )
-from .density_logging import DensityEventCallback, append_density_event_jsonl, emit_density_event
 from .field import CanonicalGaussianField, ScaleAwareResidualHead
 from .fixed_capacity import (
     CapacityAppendResult,

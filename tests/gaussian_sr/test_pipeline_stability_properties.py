@@ -3,7 +3,7 @@ import torch
 from hypothesis import given, settings
 
 from blender_temp.gaussian_sr import PoseFreeGaussianConfig, PoseFreeGaussianSR
-from blender_temp.gaussian_sr.density_control import DensityControlResult
+from blender_temp.gaussian_sr.density import DensityControlResult
 from blender_temp.gaussian_sr.warp_runtime import _WARP_AVAILABLE
 from blender_temp.gaussian_sr import pipeline as pipeline_module
 
@@ -69,34 +69,66 @@ def test_round_robin_view_ids_is_deterministic_and_covers_all_views() -> None:
 
 
 def test_density_event_is_stable_for_freeze_requires_coverage_and_no_rescue() -> None:
+    from blender_temp.gaussian_sr.density import DensityControlResult, DensityDebugSummary
+
     cfg = PoseFreeGaussianConfig().density
 
-    class _DummyDensityEvent:
-        def __init__(self, ran: bool, debug_payload: dict[str, object]) -> None:
-            self.ran = ran
-            self._debug_payload = debug_payload
+    def _make_debug(**overrides) -> DensityDebugSummary:
+        defaults = dict(
+            visibility_mean=0.0,
+            visibility_max=0.0,
+            residual_mean=0.0,
+            residual_max=0.0,
+            peak_error_mean=0.0,
+            peak_error_max=0.0,
+            transmittance_mean=0.0,
+            screen_error_bins=0,
+            gradient_mean=0.0,
+            scale_mean=0.0,
+            opacity_mean=0.0,
+            prune_protected=False,
+            coverage_weights=[],
+            visible_fraction_of_best=[],
+            intersection_fraction_of_best=[],
+            weak_view_indices=[],
+            reseed_view_indices=[],
+            view_coverages=[],
+            split_top=[],
+            clone_top=[],
+        )
+        defaults.update(overrides)
+        return DensityDebugSummary(**defaults)
 
-        def debug_dict(self) -> dict[str, object]:
-            return self._debug_payload
-
-    event = _DummyDensityEvent(ran=False, debug_payload={})
-    stable_event = _DummyDensityEvent(
+    event = DensityControlResult.skipped(10)
+    stable_event = DensityControlResult(
         ran=True,
-        debug_payload={
-            "weak_view_indices": [],
-            "reseed_view_indices": [],
-            "visible_fraction_of_best": [0.95, 0.92],
-            "intersection_fraction_of_best": [0.99, 0.96],
-        },
+        changed=False,
+        pruned=0,
+        split=0,
+        cloned=0,
+        before=10,
+        after=10,
+        debug=_make_debug(
+            weak_view_indices=[],
+            reseed_view_indices=[],
+            visible_fraction_of_best=[0.95, 0.92],
+            intersection_fraction_of_best=[0.99, 0.96],
+        ),
     )
-    unstable_event = _DummyDensityEvent(
+    unstable_event = DensityControlResult(
         ran=True,
-        debug_payload={
-            "weak_view_indices": [],
-            "reseed_view_indices": [1],
-            "visible_fraction_of_best": [0.95, 0.92],
-            "intersection_fraction_of_best": [0.99, 0.96],
-        },
+        changed=False,
+        pruned=0,
+        split=0,
+        cloned=0,
+        before=10,
+        after=10,
+        debug=_make_debug(
+            weak_view_indices=[],
+            reseed_view_indices=[1],
+            visible_fraction_of_best=[0.95, 0.92],
+            intersection_fraction_of_best=[0.99, 0.96],
+        ),
     )
 
     assert pipeline_module._density_event_is_stable_for_freeze(event, cfg) is False

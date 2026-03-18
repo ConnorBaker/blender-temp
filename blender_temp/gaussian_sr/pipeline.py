@@ -1,7 +1,7 @@
 import gc
 from collections import deque
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import time
 import warnings
 from pathlib import Path
@@ -11,14 +11,14 @@ import torch.nn as nn
 from torch import Tensor
 
 from .camera import LearnableCameraBundle, LearnableSharedIntrinsics
-from .density_control import (
+from .density import (
     DensityControlResult,
     DensityViewCoverage,
     DensityViewObservation,
     apply_density_control,
+    emit_density_event,
     should_run_density_control_for_stage,
 )
-from .density_logging import emit_density_event
 from .field import CanonicalGaussianField, ScaleAwareResidualHead
 from .image_utils import charbonnier, estimate_translation_bootstrap, ssim_value, tv_loss_grid
 from .math_utils import default_intrinsics
@@ -191,7 +191,7 @@ def _density_event_is_stable_for_freeze(
 ) -> bool:
     if not density_event.ran:
         return False
-    debug = density_event.debug_dict()
+    debug = asdict(density_event.debug) if density_event.debug is not None else {}
     if debug.get("weak_view_indices") or debug.get("reseed_view_indices"):
         return False
     visible_fraction = [float(value) for value in debug.get("visible_fraction_of_best", [])]
@@ -2152,7 +2152,7 @@ class PoseFreeGaussianSR(nn.Module):
                         )
                         self._debug_optimizer = opt
                     if density_event.ran:
-                        density_summary = density_event.debug_dict()
+                        density_summary = asdict(density_event.debug) if density_event.debug is not None else {}
                         if is_final_stage and int(self.config.density.freeze_after_stable_events) > 0:
                             if _density_event_is_stable_for_freeze(density_event, self.config.density):
                                 final_stage_density_stable_events += 1
@@ -2281,7 +2281,7 @@ class PoseFreeGaussianSR(nn.Module):
                             f"{density_msg}"
                         )
                     if density_event.ran:
-                        debug = density_event.debug_dict()
+                        debug = asdict(density_event.debug) if density_event.debug is not None else {}
                         split_top = ",".join(str(x["index"]) for x in debug.get("split_top", []))
                         clone_top = ",".join(str(x["index"]) for x in debug.get("clone_top", []))
                         self._progress_print(

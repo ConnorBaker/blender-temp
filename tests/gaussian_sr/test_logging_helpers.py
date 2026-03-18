@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from blender_temp.gaussian_sr.density_logging import append_density_event_jsonl, emit_density_event
+from blender_temp.gaussian_sr.density import append_density_event_jsonl, emit_density_event
 from blender_temp.gaussian_sr.progress_logging import append_progress_event_jsonl, emit_progress_event
 
 
